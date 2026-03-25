@@ -1,0 +1,397 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    def tqdm(x, **kwargs):
+        return x
+
+try:
+    from transformers import SegformerConfig, SegformerForSemanticSegmentation, SegformerImageProcessor
+except Exception as exc:  # pragma: no cover - runtime environment dependent
+    raise RuntimeError("transformers is required for SegFormer training.") from exc
+
+
+SUPPORTED_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
+
+def _resolve_image_dir(project_root: Path) -> Path:
+    candidates = [
+        project_root / "data" / "raw" / "train_images",
+        project_root / "data" / "raw" / "train_images_tif",
+        project_root / "data" / "raw" / "train_images_png",
+    ]
+    first_existing = None
+    for path in candidates:
+        if path.exists() and path.is_dir():
+            if first_existing is None:
+                first_existing = path
+            if any(p.suffix.lower() in SUPPORTED_SUFFIXES for p in path.iterdir() if p.is_file()):
+                return path
+    return first_existing or candidates[0]
+
+
+def _find_image_path(image_dir: Path, stem: str) -> Path | None:
+    for suffix in SUPPORTED_SUFFIXES:
+        candidate = image_dir / f"{stem}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _read_split_file(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
+def _polygon_mask(width: int, height: int, annotations: list[dict]) -> np.ndarray:
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for ann in annotations:
+        class_name = ann.get("class")
+        class_id = 1 if class_name == "individual_tree" else 2 if class_name == "group_of_trees" else None
+        if class_id is None:
+            continue
+        seg = ann.get("segmentation", [])
+        if len(seg) < 6 or len(seg) % 2 != 0:
+            continue
+        polygon = np.asarray(seg, dtype=np.float32).reshape(-1, 2)
+        polygon = np.round(polygon).astype(np.int32)
+        cv2.fillPoly(mask, [polygon], class_id)
+    return mask
+
+
+@dataclass
+class TrainConfig:
+    project_root: Path
+    annotations_path: Path
+    image_dir: Path
+    save_dir: Path
+    img_size: int = 512
+    batch_size: int = 4
+    epochs: int = 20
+    lr: float = 6e-5
+    workers: int = 0
+
+
+class SegFormerDataset(Dataset):
+    def __init__(self, records: list[dict], img_size: int):
+        self.records = records
+        self.img_size = img_size
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int):
+        record = self.records[idx]
+        image = cv2.imread(str(record["image_path"]))
+        if image is None:
+            raise FileNotFoundError(f"Could not read image: {record['image_path']}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mask = record["mask"]
+        image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+        image_t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        mask_t = torch.from_numpy(mask).long()
+        return image_t, mask_t
+
+
+def _load_records(config: TrainConfig) -> tuple[list[dict], list[dict]]:
+    payload = json.loads(config.annotations_path.read_text(encoding="utf-8"))
+    train_split = _read_split_file(config.project_root / "data" / "processed" / "train.txt")
+    val_split = _read_split_file(config.project_root / "data" / "processed" / "val.txt")
+
+    train_records: list[dict] = []
+    val_records: list[dict] = []
+    for image_info in payload.get("images", []):
+        stem = Path(image_info.get("file_name", "")).stem
+        if not stem:
+            continue
+        image_path = _find_image_path(config.image_dir, stem)
+        if image_path is None:
+            continue
+        width = int(image_info.get("width", 0))
+        height = int(image_info.get("height", 0))
+        if width <= 0 or height <= 0:
+            continue
+        mask = _polygon_mask(width, height, image_info.get("annotations", []))
+        record = {"image_path": image_path, "mask": mask}
+        if stem in val_split:
+            val_records.append(record)
+        elif stem in train_split:
+            train_records.append(record)
+        else:
+            train_records.append(record)
+
+    if not train_records:
+        raise RuntimeError("No training records found for SegFormer.")
+    if not val_records:
+        n_val = max(1, int(0.15 * len(train_records)))
+        val_records = train_records[:n_val]
+        train_records = train_records[n_val:]
+    return train_records, val_records
+
+
+def _mean_iou(pred: torch.Tensor, target: torch.Tensor, num_classes: int = 3) -> float:
+    pred_np = pred.detach().cpu().numpy()
+    target_np = target.detach().cpu().numpy()
+    ious = []
+    for cls in range(num_classes):
+        pred_c = pred_np == cls
+        target_c = target_np == cls
+        inter = np.logical_and(pred_c, target_c).sum()
+        union = np.logical_or(pred_c, target_c).sum()
+        ious.append(float(inter) / float(union + 1e-6))
+    return float(np.mean(ious))
+
+
+def _predict_mask(model: torch.nn.Module, image_bgr: np.ndarray, img_size: int, device: torch.device) -> np.ndarray:
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(image_rgb, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+    tensor = torch.from_numpy(resized).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
+    with torch.no_grad():
+        logits = model(pixel_values=tensor).logits
+        pred_small = torch.argmax(logits, dim=1)[0].detach().cpu().numpy().astype(np.uint8)
+    pred = cv2.resize(pred_small, (image_bgr.shape[1], image_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+    return pred
+
+
+def _save_evaluation_artifacts(
+    model: torch.nn.Module,
+    records: list[dict],
+    config: TrainConfig,
+    device: torch.device,
+) -> None:
+    eval_root = config.project_root / "output" / "evaluation" / "segformer"
+    masks_dir = eval_root / "masks"
+    overlays_dir = eval_root / "overlays"
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    overlays_dir.mkdir(parents=True, exist_ok=True)
+
+    cm = np.zeros((3, 3), dtype=np.int64)
+    image_ious: list[float] = []
+    tp_like_ious: list[float] = []
+    color_lut = np.array([[0, 0, 0], [0, 255, 0], [255, 255, 0]], dtype=np.uint8)
+
+    model.eval()
+    for idx, record in enumerate(records, start=1):
+        image_path: Path = record["image_path"]
+        image_bgr = cv2.imread(str(image_path))
+        if image_bgr is None:
+            continue
+        gt_mask = record["mask"].astype(np.uint8)
+        pred_mask = _predict_mask(model, image_bgr, config.img_size, device)
+
+        for cls in range(3):
+            gt_idx = gt_mask == cls
+            if not np.any(gt_idx):
+                continue
+            for pred_cls in range(3):
+                cm[cls, pred_cls] += int(np.sum(pred_mask[gt_idx] == pred_cls))
+
+        inter = np.logical_and(gt_mask > 0, pred_mask > 0).sum()
+        union = np.logical_or(gt_mask > 0, pred_mask > 0).sum()
+        iou_fg = float(inter) / float(union + 1e-6)
+        image_ious.append(iou_fg)
+        if np.any(gt_mask > 0):
+            tp_like_ious.append(iou_fg)
+
+        out_mask = (pred_mask * 127).astype(np.uint8)
+        cv2.imwrite(str(masks_dir / f"{image_path.stem}_mask_{idx:04d}.png"), out_mask)
+
+        color_mask = color_lut[np.clip(pred_mask, 0, 2)]
+        overlay = (0.6 * cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB) + 0.4 * color_mask).astype(np.uint8)
+        cv2.imwrite(str(overlays_dir / f"{image_path.stem}.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+    import matplotlib.pyplot as plt
+
+    if image_ious:
+        plt.figure(figsize=(6, 4))
+        plt.hist(image_ious, bins=20, range=(0, 1), color="#4C72B0")
+        plt.xlabel("IoU (foreground)")
+        plt.ylabel("Count")
+        plt.title("IoU Histogram")
+        plt.tight_layout()
+        plt.savefig(eval_root / "iou_hist.png")
+        plt.close()
+
+    if tp_like_ious:
+        plt.figure(figsize=(6, 4))
+        plt.hist(tp_like_ious, bins=20, range=(0, 1), color="#55A868")
+        plt.xlabel("IoU (foreground, GT-present)")
+        plt.ylabel("Count")
+        plt.title("IoU Histogram (TP-like)")
+        plt.tight_layout()
+        plt.savefig(eval_root / "iou_hist_tp_only.png")
+        plt.close()
+
+    per_class_iou = []
+    class_labels = ["background", "tree", "group"]
+    for cls in range(3):
+        tp = int(cm[cls, cls])
+        fp = int(cm[:, cls].sum() - tp)
+        fn = int(cm[cls, :].sum() - tp)
+        iou = float(tp) / float(tp + fp + fn + 1e-6)
+        per_class_iou.append(iou)
+
+    plt.figure(figsize=(6, 4))
+    xs = np.arange(3)
+    plt.bar(xs, per_class_iou, color="#C44E52")
+    plt.xticks(xs, class_labels)
+    plt.ylim(0, 1)
+    plt.ylabel("IoU")
+    plt.title("Per-class IoU (AP placeholder)")
+    for i, val in enumerate(per_class_iou):
+        plt.text(i, min(val + 0.02, 0.98), f"{val:.2f}", ha="center")
+    plt.tight_layout()
+    plt.savefig(eval_root / "ap_per_class.png")
+    plt.close()
+
+    summary = {
+        "num_images": len(records),
+        "avg_fg_iou": float(np.mean(image_ious)) if image_ious else 0.0,
+        "confusion_matrix": cm.tolist(),
+        "per_class_iou": {
+            "background": per_class_iou[0],
+            "tree": per_class_iou[1],
+            "group": per_class_iou[2],
+        },
+        "output_dir": str(eval_root),
+    }
+    (eval_root / "evaluation_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"[SegFormer] evaluation artifacts saved to {eval_root}", flush=True)
+
+
+def train(config: TrainConfig) -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    config.save_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_records, val_records = _load_records(config)
+    print(
+        f"[SegFormer] device={device} train={len(train_records)} val={len(val_records)} "
+        f"epochs={config.epochs} batch_size={config.batch_size}",
+        flush=True,
+    )
+    train_loader = DataLoader(
+        SegFormerDataset(train_records, config.img_size),
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.workers,
+    )
+    val_loader = DataLoader(
+        SegFormerDataset(val_records, config.img_size),
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.workers,
+    )
+
+    model_cfg = SegformerConfig(
+        num_labels=3,
+        hidden_sizes=[64, 128, 320, 512],
+        depths=[2, 2, 2, 2],
+        decoder_hidden_size=256,
+        reshape_last_stage=True,
+    )
+    model = SegformerForSemanticSegmentation(model_cfg).to(device)
+    processor = SegformerImageProcessor(
+        do_resize=True,
+        size={"height": config.img_size, "width": config.img_size},
+        do_rescale=False,
+        do_normalize=False,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
+
+    best_iou = -1.0
+    for epoch in range(config.epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"[SegFormer][Train] epoch {epoch+1}/{config.epochs}", dynamic_ncols=True)
+        for batch_idx, (images, masks) in enumerate(pbar, start=1):
+            images = images.to(device)
+            masks = masks.to(device)
+            outputs = model(pixel_values=images, labels=masks)
+            loss = outputs.loss
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if batch_idx % 5 == 0 or batch_idx == len(train_loader):
+                print(
+                    f"[SegFormer][Train] epoch={epoch+1}/{config.epochs} "
+                    f"batch={batch_idx}/{len(train_loader)} loss={float(loss.detach().cpu().item()):.4f}",
+                    flush=True,
+                )
+
+        model.eval()
+        val_ious = []
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f"[SegFormer][Val] epoch {epoch+1}/{config.epochs}", dynamic_ncols=True)
+            for batch_idx, (images, masks) in enumerate(val_pbar, start=1):
+                images = images.to(device)
+                masks = masks.to(device)
+                logits = model(pixel_values=images).logits
+                logits = torch.nn.functional.interpolate(
+                    logits,
+                    size=masks.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                pred = torch.argmax(logits, dim=1)
+                val_ious.append(_mean_iou(pred, masks))
+                if batch_idx % 5 == 0 or batch_idx == len(val_loader):
+                    print(
+                        f"[SegFormer][Val] epoch={epoch+1}/{config.epochs} batch={batch_idx}/{len(val_loader)}",
+                        flush=True,
+                    )
+        mean_iou = float(np.mean(val_ious)) if val_ious else 0.0
+        print(f"[SegFormer] epoch={epoch+1}/{config.epochs} val_mIoU={mean_iou:.4f}", flush=True)
+        if mean_iou > best_iou:
+            best_iou = mean_iou
+            model.save_pretrained(str(config.save_dir))
+            processor.save_pretrained(str(config.save_dir))
+            print(f"[SegFormer] saved best checkpoint to {config.save_dir}", flush=True)
+
+    print(f"[SegFormer] complete. Best IoU={best_iou:.4f}. Saved to {config.save_dir}", flush=True)
+    _save_evaluation_artifacts(model, val_records, config, device)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SegFormer training workflow")
+    parser.add_argument("action", choices=["train"], default="train")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--img-size", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=6e-5)
+    parser.add_argument("--workers", type=int, default=0)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    project_root = Path(__file__).resolve().parents[2]
+    config = TrainConfig(
+        project_root=project_root,
+        annotations_path=project_root / "data" / "raw" / "annotations" / "train_annotations.json",
+        image_dir=_resolve_image_dir(project_root),
+        save_dir=project_root / "checkpoints_segformer",
+        img_size=args.img_size,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        workers=args.workers,
+    )
+    if args.action == "train":
+        train(config)
+
+
+if __name__ == "__main__":
+    main()

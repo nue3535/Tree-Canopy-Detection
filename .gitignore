@@ -1,0 +1,49 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+.mplconfig/
+
+# Generated prediction artifacts (can be large)
+predictions_visualization/
+local_outputs/
+
+# Generated evaluation/training outputs
+output/
+*.log
+
+# Model checkpoints / weights (large binaries)
+checkpoints_deeplabv3plus/
+checkpoints_unet/
+checkpoints_mask_rcnn/
+checkpoints_segformer/
+checkpoints_sam2/*.pt
+checkpoints_sam2/*.torch
+*.pth
+*.pt
+*.torch
+
+# Data policy: keep lightweight metadata, ignore heavy datasets/artifacts
+data/raw/train_images_tif/
+data/raw/train_images_png/
+data/raw/evaluation_images_tif/
+data/raw/evaluation_images_png/
+data/processed/masks/
+
+# If annotations are regenerated locally and large, ignore them by default
+data/raw/annotations/*.json
+
+# Keep small split/metadata files tracked
+!data/README.md
+!data/raw/annotations/.gitkeep
+!data/processed/train.txt
+!data/processed/val.txt

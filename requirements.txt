@@ -1,0 +1,17 @@
+numpy
+opencv-python
+torch
+torchvision
+scipy
+scikit-learn
+matplotlib
+tqdm
+Pillow
+albumentations
+segmentation-models-pytorch
+timm
+shapely
+fastapi
+uvicorn
+python-multipart
+transformers
