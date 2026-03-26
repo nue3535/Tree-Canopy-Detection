@@ -3,9 +3,16 @@ import { useEffect, useMemo, useState } from "react";
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 function App() {
+  const getInitialTheme = () => {
+    if (typeof window === "undefined") return "blue";
+    const saved = window.localStorage.getItem("ui_theme");
+    return saved === "blue" || saved === "eco" || saved === "dark" ? saved : "blue";
+  };
+
   const [activeView, setActiveView] = useState("evaluation");
   const [file, setFile] = useState(null);
   const [method, setMethod] = useState("deeplabv3plus");
+  const [strictConservationMode, setStrictConservationMode] = useState(false);
   const [previewUrl, setPreviewUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -25,6 +32,7 @@ function App() {
   const [evaluationNotice, setEvaluationNotice] = useState("");
   const [backendApiStatus, setBackendApiStatus] = useState("checking");
   const [frontendStatus, setFrontendStatus] = useState("online");
+  const [uiTheme, setUiTheme] = useState(getInitialTheme);
 
   const sortedDistribution = useMemo(() => {
     if (!result?.class_distribution) return [];
@@ -141,6 +149,7 @@ function App() {
       const formData = new FormData();
       formData.append("file", file);
       formData.append("method", method);
+      formData.append("strict_conservation_mode", strictConservationMode ? "true" : "false");
       const response = await fetch(`${API_BASE}/api/segment`, {
         method: "POST",
         body: formData
@@ -361,10 +370,18 @@ function App() {
     return () => clearInterval(intervalId);
   }, []);
 
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", uiTheme);
+    window.localStorage.setItem("ui_theme", uiTheme);
+  }, [uiTheme]);
+
   return (
     <div className="container">
       <h1>Tree Canopy Segmentation</h1>
-      <p>Run segmentation and evaluate DeepLabV3+, SAM2, U-Net, Mask R-CNN, and SegFormer.</p>
+      <p>
+        Upload map screenshots or aerial images to detect individual trees (green), tree groups (yellow), and background
+        (black), then review land-suitability guidance for planning decisions.
+      </p>
       <div className={`api-status api-status-${backendApiStatus}`}>
         Backend API: {
           backendApiStatus === "online"
@@ -374,8 +391,17 @@ function App() {
               : "Checking..."
         }
       </div>
+      &nbsp;
       <div className={`api-status api-status-${frontendStatus === "online" ? "online" : "checking"}`}>
         Frontend Package: {frontendStatus === "online" ? "Running" : "Reconnecting..."}
+      </div>
+      <div className="theme-row">
+        <label htmlFor="ui-theme-select">Theme:</label>
+        <select id="ui-theme-select" value={uiTheme} onChange={(e) => setUiTheme(e.target.value)}>
+          <option value="blue">Blue (Default)</option>
+          <option value="eco">Eco Green</option>
+          <option value="dark">Dark</option>
+        </select>
       </div>
 
       <div className="tabs">
@@ -398,10 +424,29 @@ function App() {
               <option value="segformer">SegFormer</option>
             </select>
             <input type="file" accept="image/*" onChange={onFileChange} />
+            <label className="inline-toggle">
+              <input
+                type="checkbox"
+                checked={strictConservationMode}
+                onChange={(event) => setStrictConservationMode(event.target.checked)}
+              />
+              Strict Conservation Mode
+            </label>
             <button type="submit" disabled={loading}>
               {loading ? "Running..." : "Segment Image"}
             </button>
           </form>
+          <details className="strict-mode-details">
+            <summary>What changed in strict mode?</summary>
+            <div className="strict-mode-note">
+              Thresholds: Standard uses <code>tree + 1.4*group</code>, High if buildability &gt;= <code>0.70</code>,
+              Moderate if &gt;= <code>0.45</code>. Strict uses <code>tree + 1.8*group</code>, High if &gt;=
+              <code>0.80</code>, Moderate if &gt;= <code>0.55</code>.
+            </div>
+          </details>
+          <div className="profile-tip">
+            Mask legend: <strong>Green</strong> = individual trees, <strong>Yellow</strong> = tree groups, <strong>Black</strong> = background.
+          </div>
 
           {error ? <div className="error">{error}</div> : null}
 
@@ -449,6 +494,10 @@ function App() {
                   <p>
                     <strong>Inference mode:</strong> {result.inference_mode}
                   </p>
+                  <p>
+                    <strong>Policy mode:</strong>{" "}
+                    {result.strict_conservation_mode ? "Strict Conservation" : "Standard"}
+                  </p>
                   {result.fallback_reason ? (
                     <p>
                       <strong>Note:</strong> {result.fallback_reason}
@@ -465,6 +514,25 @@ function App() {
                       </li>
                     ))}
                   </ul>
+                  {result.suitability_assessment ? (
+                    <>
+                      <h3>Land Suitability Insight</h3>
+                      <p>
+                        <strong>Suitability Level:</strong> {result.suitability_assessment.suitability_level}
+                      </p>
+                      <p>
+                        <strong>Buildability Score:</strong>{" "}
+                        {(Number(result.suitability_assessment.buildability_score || 0) * 100).toFixed(1)}%
+                      </p>
+                      <p>
+                        <strong>Conservation Sensitivity:</strong>{" "}
+                        {(Number(result.suitability_assessment.conservation_sensitivity_score || 0) * 100).toFixed(1)}%
+                      </p>
+                      <p>
+                        <strong>Recommendation:</strong> {result.suitability_assessment.recommendation}
+                      </p>
+                    </>
+                  ) : null}
                 </>
               ) : (
                 <p>No metadata yet.</p>
@@ -495,14 +563,6 @@ function App() {
               <option value="balanced">Balanced</option>
               <option value="best-quality">Best Quality</option>
             </select>
-            <span
-              className="profile-help"
-              title={
-                "Fast: least time/compute. Balanced: recommended default. Best Quality: most time/compute with strongest expected accuracy."
-              }
-            >
-              Profile help
-            </span>
             <button type="button" onClick={startTraining} disabled={trainingBusy || evaluationLoading || isSelectedTrainingRunning}>
               {trainingBusy || isSelectedTrainingRunning ? "Start Training (Running...)" : "Start Training"}
             </button>
@@ -535,6 +595,14 @@ function App() {
               Load Page
             </button> */}
           </div>
+          <details className="profile-details">
+            <summary>Profile help</summary>
+            <div className="profile-help-note">
+              <strong>Fast:</strong> least time/compute, lower final accuracy.{" "}
+              <strong>Balanced:</strong> recommended default for quality/time.{" "}
+              <strong>Best Quality:</strong> most time/compute with strongest expected accuracy.
+            </div>
+          </details>
           <div className="profile-tip">{profileHint}</div>
           <div className="profile-tip model-tip">{modelProfileHint}</div>
 

@@ -57,6 +57,8 @@ class SegmentResponse(BaseModel):
     scene_class: int
     scene_label: str
     class_distribution: dict[str, float]
+    suitability_assessment: dict
+    strict_conservation_mode: bool
     class_labels: dict[str, str]
     class_colors: dict[str, str]
     mask_png_base64: str
@@ -131,6 +133,7 @@ def health() -> HealthResponse:
 async def segment_image(
     file: UploadFile = File(...),
     method: str = Form("deeplabv3plus"),
+    strict_conservation_mode: bool = Form(False),
 ) -> SegmentResponse:
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image uploads are supported.")
@@ -147,7 +150,11 @@ async def segment_image(
                 status_code=400,
                 detail="Invalid method. Supported values: deeplabv3plus, sam2, unet, maskrcnn, segformer.",
             )
-        result = selected_service.segment_bytes(payload, file.filename or "upload.png")
+        result = selected_service.segment_bytes(
+            payload,
+            file.filename or "upload.png",
+            strict_conservation_mode=strict_conservation_mode,
+        )
         result["method"] = method_key
         return SegmentResponse(**result)
     except HTTPException:

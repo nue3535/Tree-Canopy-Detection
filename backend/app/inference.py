@@ -75,6 +75,55 @@ CLASS_COLORS_HEX = {
 }
 
 
+def _land_use_assessment(
+    distribution: dict[str, float],
+    strict_conservation_mode: bool = False,
+) -> dict[str, str | float | bool]:
+    """Simple decision-support summary based on canopy coverage."""
+    bg_ratio = float(distribution.get("0", 0.0))
+    tree_ratio = float(distribution.get("1", 0.0))
+    group_ratio = float(distribution.get("2", 0.0))
+
+    # Dense grouped canopy is usually more environmentally sensitive.
+    group_weight = 1.8 if strict_conservation_mode else 1.4
+    weighted_canopy = min(1.0, tree_ratio + group_weight * group_ratio)
+    buildability_score = max(0.0, 1.0 - weighted_canopy)
+    conservation_score = min(1.0, weighted_canopy)
+
+    high_threshold = 0.80 if strict_conservation_mode else 0.70
+    moderate_threshold = 0.55 if strict_conservation_mode else 0.45
+
+    if buildability_score >= high_threshold:
+        suitability = "High"
+        recommendation = "Potentially suitable for infrastructure development with standard environmental checks."
+    elif buildability_score >= moderate_threshold:
+        suitability = "Moderate"
+        recommendation = (
+            "Partially suitable; prioritize low-impact planning and preserve identified tree zones."
+            if not strict_conservation_mode
+            else "Partially suitable under strict policy; require stronger mitigation and retention of canopy patches."
+        )
+    else:
+        suitability = "Low"
+        recommendation = (
+            "Environmentally sensitive; avoid heavy development and consider conservation-first options."
+            if not strict_conservation_mode
+            else "Environmentally sensitive under strict policy; avoid development and prioritize conservation."
+        )
+
+    return {
+        "policy_mode": "strict_conservation" if strict_conservation_mode else "standard",
+        "strict_conservation_mode": bool(strict_conservation_mode),
+        "suitability_level": suitability,
+        "buildability_score": round(buildability_score, 4),
+        "conservation_sensitivity_score": round(conservation_score, 4),
+        "background_ratio": round(bg_ratio, 4),
+        "individual_tree_ratio": round(tree_ratio, 4),
+        "tree_group_ratio": round(group_ratio, 4),
+        "recommendation": recommendation,
+    }
+
+
 def _to_hydra_config_name(config_path: Path) -> str:
     """Convert absolute SAM2 YAML path to Hydra config name."""
     norm = str(config_path).replace("\\", "/")
@@ -267,23 +316,35 @@ def build_response(
     scene_class: int,
     inference_mode: str,
     fallback_reason: str,
+    strict_conservation_mode: bool = False,
 ) -> dict:
     overlay = mask_overlay(original_image, seg_mask)
     unique, counts = np.unique(seg_mask, return_counts=True)
     total = int(seg_mask.size) if seg_mask.size > 0 else 1
-    distribution = {
+    observed_distribution = {
         str(int(cls_id)): round(float(count) / total, 6)
         for cls_id, count in zip(unique.tolist(), counts.tolist())
+    }
+    distribution = {
+        "0": float(observed_distribution.get("0", 0.0)),
+        "1": float(observed_distribution.get("1", 0.0)),
+        "2": float(observed_distribution.get("2", 0.0)),
     }
     scene_label = (
         SCENE_LABELS[scene_class]
         if 0 <= int(scene_class) < len(SCENE_LABELS)
         else f"class_{scene_class}"
     )
+    suitability_assessment = _land_use_assessment(
+        distribution,
+        strict_conservation_mode=strict_conservation_mode,
+    )
     return {
         "scene_class": int(scene_class),
         "scene_label": scene_label,
         "class_distribution": distribution,
+        "suitability_assessment": suitability_assessment,
+        "strict_conservation_mode": bool(strict_conservation_mode),
         "class_labels": CLASS_LABELS,
         "class_colors": CLASS_COLORS_HEX,
         "mask_png_base64": image_to_base64(colorize_mask(seg_mask)),
@@ -339,7 +400,7 @@ class DeepLabSegmentationService:
             )
         return original_image, seg_mask, int(scene_class), "deeplab_model", ""
 
-    def segment_bytes(self, image_bytes: bytes, filename: str) -> dict:
+    def segment_bytes(self, image_bytes: bytes, filename: str, strict_conservation_mode: bool = False) -> dict:
         original_image, seg_mask, scene_class, inference_mode, fallback_reason = self._predict_components(
             image_bytes,
             filename,
@@ -350,6 +411,7 @@ class DeepLabSegmentationService:
             scene_class=scene_class,
             inference_mode=inference_mode,
             fallback_reason=fallback_reason,
+            strict_conservation_mode=strict_conservation_mode,
         )
 
 
@@ -474,7 +536,7 @@ class SAM2SegmentationService:
         original_image, seg_mask = self._sam2_segment(image_bytes)
         return original_image, seg_mask, 2, "sam2_model", ""
 
-    def segment_bytes(self, image_bytes: bytes, filename: str) -> dict:
+    def segment_bytes(self, image_bytes: bytes, filename: str, strict_conservation_mode: bool = False) -> dict:
         original_image, seg_mask, scene_class, inference_mode, fallback_reason = self._predict_components(
             image_bytes,
             filename,
@@ -485,6 +547,7 @@ class SAM2SegmentationService:
             scene_class=scene_class,
             inference_mode=inference_mode,
             fallback_reason=fallback_reason,
+            strict_conservation_mode=strict_conservation_mode,
         )
 
 
@@ -571,7 +634,7 @@ class UNetSegmentationService:
         )
         return original_image, seg_mask, 2, "unet_model", ""
 
-    def segment_bytes(self, image_bytes: bytes, filename: str) -> dict:
+    def segment_bytes(self, image_bytes: bytes, filename: str, strict_conservation_mode: bool = False) -> dict:
         original_image, seg_mask, scene_class, inference_mode, fallback_reason = self._predict_components(
             image_bytes,
             filename,
@@ -582,6 +645,7 @@ class UNetSegmentationService:
             scene_class=scene_class,
             inference_mode=inference_mode,
             fallback_reason=fallback_reason,
+            strict_conservation_mode=strict_conservation_mode,
         )
 
 
@@ -679,7 +743,7 @@ class MaskRCNNSegmentationService:
             occupancy = np.logical_or(occupancy, instance_mask)
         return original_image, seg_mask, 2, "maskrcnn_model", ""
 
-    def segment_bytes(self, image_bytes: bytes, filename: str) -> dict:
+    def segment_bytes(self, image_bytes: bytes, filename: str, strict_conservation_mode: bool = False) -> dict:
         original_image, seg_mask, scene_class, inference_mode, fallback_reason = self._predict_components(
             image_bytes,
             filename,
@@ -690,6 +754,7 @@ class MaskRCNNSegmentationService:
             scene_class=scene_class,
             inference_mode=inference_mode,
             fallback_reason=fallback_reason,
+            strict_conservation_mode=strict_conservation_mode,
         )
 
 
@@ -759,7 +824,7 @@ class SegFormerSegmentationService:
             pred = torch.argmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
         return original_image, pred, 2, "segformer_model", ""
 
-    def segment_bytes(self, image_bytes: bytes, filename: str) -> dict:
+    def segment_bytes(self, image_bytes: bytes, filename: str, strict_conservation_mode: bool = False) -> dict:
         original_image, seg_mask, scene_class, inference_mode, fallback_reason = self._predict_components(
             image_bytes,
             filename,
@@ -770,4 +835,5 @@ class SegFormerSegmentationService:
             scene_class=scene_class,
             inference_mode=inference_mode,
             fallback_reason=fallback_reason,
+            strict_conservation_mode=strict_conservation_mode,
         )
