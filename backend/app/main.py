@@ -118,6 +118,11 @@ class TrainingStopResponse(BaseModel):
     message: str
 
 
+class TrainingResultsResponse(BaseModel):
+    generated_at: int
+    results: dict
+
+
 class EvaluationPrecheckResponse(BaseModel):
     generated_at: int
     methods: dict
@@ -190,6 +195,26 @@ def evaluation_precheck() -> EvaluationPrecheckResponse:
         raise HTTPException(status_code=500, detail=f"Precheck failed: {exc}") from exc
 
 
+@app.get("/api/evaluation/training-results", response_model=TrainingResultsResponse)
+def training_results() -> TrainingResultsResponse:
+    import json
+
+    project_root = Path(__file__).resolve().parents[2]
+    eval_root = project_root / "output" / "evaluation"
+    results: dict = {}
+    for method in SEGMENTATION_SERVICES:
+        results_path = eval_root / method / "training_results.json"
+        if results_path.exists():
+            try:
+                payload = json.loads(results_path.read_text(encoding="utf-8"))
+                results[method] = payload
+            except Exception:
+                results[method] = None
+        else:
+            results[method] = None
+    return TrainingResultsResponse(generated_at=int(time.time()), results=results)
+
+
 @app.get("/api/evaluation/page", response_model=EvaluationPageResponse)
 def evaluation_page(
     dataset: str,
@@ -225,7 +250,7 @@ def evaluation_page(
 
 
 @app.post("/api/evaluation/train", response_model=TrainingStartResponse)
-def start_training(method: str = Form(...), profile: str = Form("balanced")) -> TrainingStartResponse:
+def start_training(method: str = Form(...), profile: str = Form("best-quality")) -> TrainingStartResponse:
     method_key = method.strip().lower()
     profile_key = profile.strip().lower()
     if method_key not in TRAINABLE_METHODS:
@@ -236,7 +261,7 @@ def start_training(method: str = Form(...), profile: str = Form("balanced")) -> 
     if profile_key not in TrainingManager.SUPPORTED_PROFILES:
         raise HTTPException(
             status_code=400,
-            detail="profile must be one of: fast, balanced, best-quality.",
+            detail="profile must be best-quality.",
         )
     try:
         state = training_manager.start_training(method_key, profile=profile_key)

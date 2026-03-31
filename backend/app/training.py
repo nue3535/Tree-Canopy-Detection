@@ -22,7 +22,8 @@ class JobState:
 
 
 class TrainingManager:
-    SUPPORTED_PROFILES = {"fast", "balanced", "best-quality"}
+    """Single training tier: best-quality presets only (Fast / Balanced removed)."""
+    SUPPORTED_PROFILES = {"best-quality"}
 
     def __init__(self) -> None:
         self.project_root = Path(__file__).resolve().parents[2]
@@ -40,39 +41,18 @@ class TrainingManager:
         return None
 
     def _profile_args_for_method(self, method: str, profile: str) -> list[str]:
-        """Profile presets for each model training workflow."""
-        presets: dict[str, dict[str, list[str]]] = {
-            "deeplabv3plus": {
-                "fast": ["--epochs", "20", "--img-size", "512", "--lr", "1e-4"],
-                "balanced": ["--epochs", "60", "--img-size", "640", "--lr", "1e-4"],
-                "best-quality": ["--epochs", "90", "--img-size", "640", "--lr", "8e-5"],
-            },
-            "sam2": {
-                "fast": [],
-                "balanced": [],
-                "best-quality": [],
-            },
-            "unet": {
-                "fast": ["--epochs", "12", "--lr", "2e-4"],
-                "balanced": ["--epochs", "30", "--lr", "2e-4"],
-                "best-quality": ["--epochs", "50", "--lr", "1.5e-4"],
-            },
-            "maskrcnn": {
-                "fast": ["--epochs", "4", "--img-size", "320", "--max-instances-per-image", "60", "--lr", "1e-4"],
-                "balanced": ["--epochs", "10", "--img-size", "384", "--max-instances-per-image", "80", "--lr", "1e-4"],
-                "best-quality": ["--epochs", "16", "--img-size", "448", "--max-instances-per-image", "100", "--lr", "8e-5"],
-            },
-            "segformer": {
-                "fast": ["--epochs", "8", "--img-size", "448", "--lr", "7e-5"],
-                "balanced": ["--epochs", "20", "--img-size", "512", "--lr", "6e-5"],
-                "best-quality": ["--epochs", "35", "--img-size", "640", "--lr", "4e-5"],
-            },
-        }
+        """Best-quality CLI overrides per workflow (SAM2 uses env vars only)."""
         if method == "sam2":
-            # SAM2 uses module-level constants; tune via env vars.
             return []
-        method_presets = presets.get(method, {})
-        return method_presets.get(profile, [])
+        if profile != "best-quality":
+            return []
+        best: dict[str, list[str]] = {
+            "deeplabv3plus": ["--epochs", "120", "--lr", "6e-5", "--patience", "40"],
+            "unet": ["--epochs", "50", "--lr", "8e-5"],
+            "maskrcnn": ["--epochs", "16", "--max-instances-per-image", "100", "--lr", "8e-5"],
+            "segformer": ["--epochs", "35", "--lr", "8e-5"],
+        }
+        return best.get(method, [])
 
     def _command_for_method(self, method: str, profile: str) -> list[str]:
         if method == "deeplabv3plus":
@@ -123,20 +103,12 @@ class TrainingManager:
         if method != "sam2":
             return env
 
-        # SAM2 profile control is env-driven because workflow reads module constants.
-        sam2_profile = profile if profile in self.SUPPORTED_PROFILES else "balanced"
-        if sam2_profile == "fast":
-            env["SAM2_STEPS"] = "1200"
-            env["SAM2_SAVE_EVERY"] = "100"
-            env["SAM2_LR"] = "1e-5"
-        elif sam2_profile == "best-quality":
-            env["SAM2_STEPS"] = "6000"
-            env["SAM2_SAVE_EVERY"] = "250"
-            env["SAM2_LR"] = "8e-6"
-        else:
-            env["SAM2_STEPS"] = "3000"
-            env["SAM2_SAVE_EVERY"] = "200"
-            env["SAM2_LR"] = "1e-5"
+        # SAM2: best-quality tier only (env overrides module defaults).
+        env["SAM2_MIN_MASK_SCORE"] = "0.3"
+        env["SAM2_STEPS"] = "6000"
+        env["SAM2_SAVE_EVERY"] = "250"
+        env["SAM2_BATCH_SIZE"] = "6"
+        env["SAM2_LR"] = "8e-5"
 
         cfg_env = env.get("SAM2_MODEL_CFG") or env.get("MODEL_CFG")
         ckpt_env = env.get("SAM2_CHECKPOINT")
@@ -165,7 +137,7 @@ class TrainingManager:
 
         return env
 
-    def start_training(self, method: str, profile: str = "balanced") -> JobState:
+    def start_training(self, method: str, profile: str = "best-quality") -> JobState:
         method = method.strip().lower()
         profile = profile.strip().lower()
         if profile not in self.SUPPORTED_PROFILES:

@@ -1,6 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+const TRAINING_STATUS_POLL_MS = 2500;
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+
+/** Row order and display names aligned with Assessment 3 comparison table. */
+const EVALUATION_TABLE_ROWS = [
+  { key: "unet", label: "U-Net" },
+  { key: "deeplabv3plus", label: "DeepLabV3" },
+  { key: "maskrcnn", label: "Mask R-CNN" },
+  { key: "segformer", label: "SegFormer" },
+  { key: "sam2", label: "SAM2 (Zero-shot)" }
+];
+
+const METHOD_LABELS = Object.fromEntries(EVALUATION_TABLE_ROWS.map(({ key, label }) => [key, label]));
 
 function App() {
   const getInitialTheme = () => {
@@ -11,33 +24,20 @@ function App() {
 
   const [activeView, setActiveView] = useState("evaluation");
   const [file, setFile] = useState(null);
-  const [method, setMethod] = useState("deeplabv3plus");
-  const [strictConservationMode, setStrictConservationMode] = useState(false);
+  const [method, setMethod] = useState("unet");
   const [previewUrl, setPreviewUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
-  const [evaluationLoading, setEvaluationLoading] = useState(false);
   const [evaluationError, setEvaluationError] = useState("");
-  const [evaluationSummary, setEvaluationSummary] = useState(null);
-  const [evaluationDataset, setEvaluationDataset] = useState("evaluation");
-  const [evaluationMethod, setEvaluationMethod] = useState("all");
-  const [trainingMethod, setTrainingMethod] = useState("deeplabv3plus");
-  const [trainingProfile, setTrainingProfile] = useState("balanced");
-  const [evaluationPage, setEvaluationPage] = useState(1);
-  const [evaluationRowsPayload, setEvaluationRowsPayload] = useState(null);
+  const [trainingMethod, setTrainingMethod] = useState("unet");
   const [trainingStatus, setTrainingStatus] = useState(null);
   const [trainingBusy, setTrainingBusy] = useState(false);
-  const [evaluationPrecheck, setEvaluationPrecheck] = useState(null);
-  const [evaluationNotice, setEvaluationNotice] = useState("");
   const [backendApiStatus, setBackendApiStatus] = useState("checking");
   const [frontendStatus, setFrontendStatus] = useState("online");
   const [uiTheme, setUiTheme] = useState(getInitialTheme);
-
-  const sortedDistribution = useMemo(() => {
-    if (!result?.class_distribution) return [];
-    return Object.entries(result.class_distribution).sort((a, b) => Number(a[0]) - Number(b[0]));
-  }, [result]);
+  const [trainingResults, setTrainingResults] = useState(null);
+  const [trainingResultsLoading, setTrainingResultsLoading] = useState(false);
 
   const legendItems = useMemo(() => {
     if (!result?.class_labels || !result?.class_colors) return [];
@@ -50,78 +50,20 @@ function App() {
       }));
   }, [result]);
 
-  const summaryCards = useMemo(() => {
-    if (!evaluationSummary) return [];
-    const methods = evaluationSummary.methods || [];
-    return methods.map((m) => {
-      const section = evaluationDataset === "train" ? evaluationSummary.train[m] : evaluationSummary.evaluation[m];
-      return section?.summary ? { method: m, ...section.summary } : { method: m };
-    });
-  }, [evaluationSummary, evaluationDataset]);
-
-  const selectedSummary = useMemo(() => {
-    if (!evaluationSummary) return null;
-    if (evaluationMethod === "all") return null;
-    const section = evaluationDataset === "train" ? evaluationSummary.train?.[evaluationMethod] : evaluationSummary.evaluation?.[evaluationMethod];
-    return section?.summary || null;
-  }, [evaluationSummary, evaluationDataset, evaluationMethod]);
-
-  const isMetricsApplicableForTable = useMemo(() => {
-    if (evaluationDataset === "train") return true;
-    if (!evaluationSummary) return false;
-    if (evaluationMethod === "all") return Boolean(evaluationSummary.evaluation_has_ground_truth);
-    return Boolean(selectedSummary?.metrics_applicable);
-  }, [evaluationDataset, evaluationSummary, evaluationMethod, selectedSummary]);
-
-  const comparisonLocked = useMemo(() => {
-    return Boolean(evaluationPrecheck?.any_fallback_risk);
-  }, [evaluationPrecheck]);
-
   const isSelectedTrainingRunning = useMemo(() => {
     return trainingStatus?.status === "running" && trainingStatus?.method === trainingMethod;
   }, [trainingStatus, trainingMethod]);
 
-  const profileHint = useMemo(() => {
-    if (trainingProfile === "fast") {
-      return "Fast: shortest runtime, lowest compute, lower final accuracy.";
-    }
-    if (trainingProfile === "best-quality") {
-      return "Best Quality: longest runtime, highest compute, strongest expected accuracy.";
-    }
-    return "Balanced: recommended default with good quality/time trade-off.";
-  }, [trainingProfile]);
-
-  const modelProfileHint = useMemo(() => {
-    const hints = {
-      deeplabv3plus: {
-        fast: "DeepLabV3+ Fast: usually the quickest stable baseline.",
-        balanced: "DeepLabV3+ Balanced: strong baseline for quality vs time.",
-        "best-quality": "DeepLabV3+ Best Quality: longer run, best expected DeepLab accuracy."
-      },
-      sam2: {
-        fast: "SAM2 Fast: moderate runtime; prompt-based training still compute-heavy.",
-        balanced: "SAM2 Balanced: better convergence; checkpoint writes every 200 steps.",
-        "best-quality": "SAM2 Best Quality: longest SAM2 run; best if you can leave it overnight."
-      },
-      unet: {
-        fast: "U-Net Fast: very practical on CPU/GPU for quick experiments.",
-        balanced: "U-Net Balanced: good default for reliable canopy segmentation.",
-        "best-quality": "U-Net Best Quality: longer epochs, typically improves boundary consistency."
-      },
-      maskrcnn: {
-        fast: "Mask R-CNN Fast: still heavy; keep expectations moderate on CPU.",
-        balanced: "Mask R-CNN Balanced: robust but often the slowest among the five.",
-        "best-quality": "Mask R-CNN Best Quality: highest memory/time demand; prefer GPU."
-      },
-      segformer: {
-        fast: "SegFormer Fast: efficient transformer baseline with reasonable quality.",
-        balanced: "SegFormer Balanced: strong general-purpose choice.",
-        "best-quality": "SegFormer Best Quality: high compute, often top semantic quality."
-      }
+  const trainingTierNote = useMemo(() => {
+    const byMethod = {
+      deeplabv3plus: "Training uses the best-quality preset (longer schedule, stronger expected accuracy). Prefer a capable GPU.",
+      sam2: "Training uses the best-quality SAM2 preset (more steps, lower LR). Expect long runs and high memory use.",
+      unet: "Training uses the best-quality U-Net preset (more epochs).",
+      maskrcnn: "Training uses the best-quality Mask R-CNN preset; this path is the heaviest—GPU strongly recommended.",
+      segformer: "Training uses the best-quality SegFormer preset (more epochs)."
     };
-    const byMethod = hints[trainingMethod] || hints.deeplabv3plus;
-    return byMethod[trainingProfile] || byMethod.balanced;
-  }, [trainingMethod, trainingProfile]);
+    return byMethod[trainingMethod] || byMethod.unet;
+  }, [trainingMethod]);
 
   const onFileChange = (event) => {
     const selected = event.target.files?.[0] || null;
@@ -149,7 +91,7 @@ function App() {
       const formData = new FormData();
       formData.append("file", file);
       formData.append("method", method);
-      formData.append("strict_conservation_mode", strictConservationMode ? "true" : "false");
+      formData.append("strict_conservation_mode", "false");
       const response = await fetch(`${API_BASE}/api/segment`, {
         method: "POST",
         body: formData
@@ -184,73 +126,57 @@ function App() {
     }
   };
 
-  const runEvaluation = async (force = false) => {
-    setEvaluationLoading(true);
-    setEvaluationError("");
-    setEvaluationNotice("");
+  const loadTrainingResults = useCallback(async () => {
+    setTrainingResultsLoading(true);
     try {
-      const precheckPayload = await runPrecheck();
-      const response = await fetch(`${API_BASE}/api/evaluation/summary?force=${force ? "true" : "false"}`);
+      const response = await fetch(`${API_BASE}/api/evaluation/training-results`);
       const payload = await response.json();
       if (!response.ok) {
-        throw new Error(payload.detail || "Failed to run evaluation.");
+        throw new Error(payload.detail || "Failed to fetch training results.");
       }
-      setEvaluationSummary(payload);
-      setEvaluationPage(1);
-      await loadEvaluationPage(1, payload);
-      if (precheckPayload?.any_fallback_risk) {
-        setEvaluationNotice("Some methods are in fallback mode. Cross-model comparison is not fully reliable.");
-      }
-    } catch (err) {
-      setEvaluationError(err.message || "Unexpected evaluation error");
+      setTrainingResults(payload.results);
+    } catch {
+      setTrainingResults(null);
     } finally {
-      setEvaluationLoading(false);
+      setTrainingResultsLoading(false);
     }
-  };
+  }, []);
 
-  const runPrecheck = async () => {
-    const response = await fetch(`${API_BASE}/api/evaluation/precheck`);
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.detail || "Failed to run evaluation precheck.");
-    }
-    setEvaluationPrecheck(payload);
-    return payload;
-  };
-
-  const loadEvaluationPage = async (targetPage = evaluationPage, summaryOverride = evaluationSummary) => {
-    if (!summaryOverride) return;
-    setEvaluationLoading(true);
-    setEvaluationError("");
-    try {
-      const params = new URLSearchParams({
-        dataset: evaluationDataset,
-        method: evaluationMethod,
-        page: String(targetPage),
-        page_size: "10"
-      });
-      const response = await fetch(`${API_BASE}/api/evaluation/page?${params.toString()}`);
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.detail || "Failed to fetch evaluation page.");
+  const loadTrainingStatus = useCallback(
+    async (options = {}) => {
+      const silent = Boolean(options.silent);
+      if (!silent) {
+        setTrainingBusy(true);
+        setEvaluationError("");
       }
-      setEvaluationRowsPayload(payload);
-    } catch (err) {
-      setEvaluationError(err.message || "Unexpected pagination error");
-    } finally {
-      setEvaluationLoading(false);
-    }
-  };
-
-  const onDatasetChange = (value) => {
-    setEvaluationDataset(value);
-    setEvaluationPage(1);
-  };
-
-  const onMethodChange = (value) => {
-    setEvaluationMethod(value);
-    setEvaluationPage(1);
-  };
+      try {
+        const response = await fetch(`${API_BASE}/api/evaluation/train-status?method=${trainingMethod}`);
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || "Failed to fetch training status.");
+        }
+        setTrainingStatus((prev) => {
+          const prevTerminal = prev?.status === "completed" || prev?.status === "failed";
+          const nowTerminal = payload.status === "completed" || payload.status === "failed";
+          if (nowTerminal && !prevTerminal) {
+            queueMicrotask(() => {
+              loadTrainingResults();
+            });
+          }
+          return payload;
+        });
+      } catch (err) {
+        if (!silent) {
+          setEvaluationError(err.message || "Unexpected training-status error");
+        }
+      } finally {
+        if (!silent) {
+          setTrainingBusy(false);
+        }
+      }
+    },
+    [trainingMethod, loadTrainingResults]
+  );
 
   const startTraining = async () => {
     setTrainingBusy(true);
@@ -258,7 +184,7 @@ function App() {
     try {
       const formData = new FormData();
       formData.append("method", trainingMethod);
-      formData.append("profile", trainingProfile);
+      formData.append("profile", "best-quality");
       const response = await fetch(`${API_BASE}/api/evaluation/train`, {
         method: "POST",
         body: formData
@@ -268,25 +194,9 @@ function App() {
         throw new Error(payload.detail || "Failed to start training.");
       }
       setTrainingStatus(payload);
+      void loadTrainingStatus({ silent: true });
     } catch (err) {
       setEvaluationError(err.message || "Unexpected training-start error");
-    } finally {
-      setTrainingBusy(false);
-    }
-  };
-
-  const loadTrainingStatus = async () => {
-    setTrainingBusy(true);
-    setEvaluationError("");
-    try {
-      const response = await fetch(`${API_BASE}/api/evaluation/train-status?method=${trainingMethod}`);
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.detail || "Failed to fetch training status.");
-      }
-      setTrainingStatus(payload);
-    } catch (err) {
-      setEvaluationError(err.message || "Unexpected training-status error");
     } finally {
       setTrainingBusy(false);
     }
@@ -326,10 +236,21 @@ function App() {
   };
 
   useEffect(() => {
-    if (activeView !== "evaluation" || !evaluationSummary) return;
-    loadEvaluationPage();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeView, evaluationDataset, evaluationMethod, evaluationPage]);
+    if (activeView === "evaluation") {
+      loadTrainingResults();
+    }
+  }, [activeView, loadTrainingResults]);
+
+  useEffect(() => {
+    if (activeView !== "evaluation") {
+      return undefined;
+    }
+    void loadTrainingStatus({ silent: true });
+    const id = setInterval(() => {
+      void loadTrainingStatus({ silent: true });
+    }, TRAINING_STATUS_POLL_MS);
+    return () => clearInterval(id);
+  }, [activeView, trainingMethod, loadTrainingStatus]);
 
   useEffect(() => {
     checkBackendHealth();
@@ -378,9 +299,19 @@ function App() {
   return (
     <div className="container">
       <h1>Tree Canopy Segmentation</h1>
-      <p>
-        Upload map screenshots or aerial images to detect individual trees (green), tree groups (yellow), and background
-        (black), then review land-suitability guidance for planning decisions.
+      <p className="app-lead">
+        {activeView === "segmentation" ? (
+          <>
+            <strong>Assessment 3 — Segmentation:</strong> select one of the five required CNN architectures, upload a test
+            image, and compare the input with the predicted overlay and class mask (background, individual trees, tree
+            groups).
+          </>
+        ) : (
+          <>
+            Use <strong>Evaluation</strong> to train models and record train / validation / test accuracy. Use{" "}
+            <strong>Segmentation</strong> for qualitative inference on a single image.
+          </>
+        )}
       </p>
       <div className={`api-status api-status-${backendApiStatus}`}>
         Backend API: {
@@ -414,383 +345,225 @@ function App() {
       </div>
 
       {activeView === "segmentation" ? (
-        <>
-          <form onSubmit={submit} className="card">
-            <select value={method} onChange={(event) => setMethod(event.target.value)}>
-              <option value="deeplabv3plus">DeepLabV3+</option>
-              <option value="sam2">SAM2</option>
-              <option value="unet">U-Net</option>
-              <option value="maskrcnn">Mask R-CNN</option>
-              <option value="segformer">SegFormer</option>
-            </select>
-            <input type="file" accept="image/*" onChange={onFileChange} />
-            <label className="inline-toggle">
-              <input
-                type="checkbox"
-                checked={strictConservationMode}
-                onChange={(event) => setStrictConservationMode(event.target.checked)}
-              />
-              Strict Conservation Mode
-            </label>
-            <button type="submit" disabled={loading}>
-              {loading ? "Running..." : "Segment Image"}
-            </button>
-          </form>
-          <details className="strict-mode-details">
-            <summary>What changed in strict mode?</summary>
-            <div className="strict-mode-note">
-              Thresholds: Standard uses <code>tree + 1.4*group</code>, High if buildability &gt;= <code>0.70</code>,
-              Moderate if &gt;= <code>0.45</code>. Strict uses <code>tree + 1.8*group</code>, High if &gt;=
-              <code>0.80</code>, Moderate if &gt;= <code>0.55</code>.
+        <section className="seg-spec-panel">
+          <form onSubmit={submit} className="card seg-control-card">
+            <div className="seg-control-row">
+              <label className="seg-field">
+                <span className="seg-field-label">CNN architecture</span>
+                <select value={method} onChange={(event) => setMethod(event.target.value)} aria-label="CNN architecture">
+                  <option value="unet">U-Net</option>
+                  <option value="deeplabv3plus">DeepLabV3</option>
+                  <option value="maskrcnn">Mask R-CNN</option>
+                  <option value="segformer">SegFormer</option>
+                  <option value="sam2">SAM2 (Zero-shot)</option>
+                </select>
+              </label>
+              <label className="seg-field seg-field-file">
+                <span className="seg-field-label">Test image</span>
+                <input type="file" accept="image/*" onChange={onFileChange} />
+              </label>
+              <button type="submit" disabled={loading} className="seg-submit-btn">
+                {loading ? "Running…" : "Run segmentation"}
+              </button>
             </div>
-          </details>
-          <div className="profile-tip">
-            Mask legend: <strong>Green</strong> = individual trees, <strong>Yellow</strong> = tree groups, <strong>Black</strong> = background.
-          </div>
+          </form>
 
           {error ? <div className="error">{error}</div> : null}
 
-          <div className="grid">
-            <div className="card">
-              <h2>Input</h2>
-              {previewUrl ? <img src={previewUrl} alt="Input preview" /> : <p>No image selected.</p>}
+          <div className="seg-results-grid">
+            <div className="card seg-result-card">
+              <h2 className="seg-result-title">Input</h2>
+              {previewUrl ? <img src={previewUrl} alt="Input preview" className="seg-result-img" /> : <p className="seg-placeholder">Choose an image to preview.</p>}
             </div>
-
-            <div className="card">
-              <h2>Segmentation Overlay</h2>
+            <div className="card seg-result-card">
+              <h2 className="seg-result-title">Overlay</h2>
               {result?.overlay_png_base64 ? (
-                <img src={`data:image/png;base64,${result.overlay_png_base64}`} alt="Overlay result" />
+                <img
+                  src={`data:image/png;base64,${result.overlay_png_base64}`}
+                  alt="Prediction overlay"
+                  className="seg-result-img"
+                />
               ) : (
-                <p>No prediction yet.</p>
+                <p className="seg-placeholder">Run segmentation to see the overlay.</p>
               )}
             </div>
-
-            <div className="card">
-              <h2>Segmentation Mask</h2>
+            <div className="card seg-result-card">
+              <h2 className="seg-result-title">Class mask</h2>
               {result?.mask_png_base64 ? (
-                <>
-                  <img src={`data:image/png;base64,${result.mask_png_base64}`} alt="Segmentation mask result" />
-                  <div className="legend">
-                    {legendItems.map((item) => (
-                      <div className="legend-item" key={item.classId}>
-                        <span className="swatch" style={{ backgroundColor: item.color }} />
-                        <span>{item.label}</span>
-                      </div>
-                    ))}
-                  </div>
-                </>
+                <img
+                  src={`data:image/png;base64,${result.mask_png_base64}`}
+                  alt="Class mask"
+                  className="seg-result-img"
+                />
               ) : (
-                <p>No prediction yet.</p>
-              )}
-            </div>
-
-            <div className="card">
-              <h2>Metadata</h2>
-              {result ? (
-                <>
-                  <p>
-                    <strong>Method:</strong> {result.method}
-                  </p>
-                  <p>
-                    <strong>Inference mode:</strong> {result.inference_mode}
-                  </p>
-                  <p>
-                    <strong>Policy mode:</strong>{" "}
-                    {result.strict_conservation_mode ? "Strict Conservation" : "Standard"}
-                  </p>
-                  {result.fallback_reason ? (
-                    <p>
-                      <strong>Note:</strong> {result.fallback_reason}
-                    </p>
-                  ) : null}
-                  <p>
-                    <strong>Scene:</strong> {result.scene_label} (class {result.scene_class})
-                  </p>
-                  <h3>Class Distribution</h3>
-                  <ul>
-                    {sortedDistribution.map(([classId, ratio]) => (
-                      <li key={classId}>
-                        Class {classId}: {(ratio * 100).toFixed(2)}%
-                      </li>
-                    ))}
-                  </ul>
-                  {result.suitability_assessment ? (
-                    <>
-                      <h3>Land Suitability Insight</h3>
-                      <p>
-                        <strong>Suitability Level:</strong> {result.suitability_assessment.suitability_level}
-                      </p>
-                      <p>
-                        <strong>Buildability Score:</strong>{" "}
-                        {(Number(result.suitability_assessment.buildability_score || 0) * 100).toFixed(1)}%
-                      </p>
-                      <p>
-                        <strong>Conservation Sensitivity:</strong>{" "}
-                        {(Number(result.suitability_assessment.conservation_sensitivity_score || 0) * 100).toFixed(1)}%
-                      </p>
-                      <p>
-                        <strong>Recommendation:</strong> {result.suitability_assessment.recommendation}
-                      </p>
-                    </>
-                  ) : null}
-                </>
-              ) : (
-                <p>No metadata yet.</p>
+                <p className="seg-placeholder">Run segmentation to see the mask.</p>
               )}
             </div>
           </div>
-        </>
-      ) : (
-        <>
-          <div className="card eval-controls">
-            <select
-              value={trainingMethod}
-              onChange={(e) => setTrainingMethod(e.target.value)}
-              disabled={trainingBusy || evaluationLoading || trainingStatus?.status === "running"}
-            >
-              <option value="deeplabv3plus">DeepLabV3+</option>
-              <option value="sam2">SAM2</option>
-              <option value="unet">U-Net</option>
-              <option value="maskrcnn">Mask R-CNN</option>
-              <option value="segformer">SegFormer</option>
-            </select>
-            <select
-              value={trainingProfile}
-              onChange={(e) => setTrainingProfile(e.target.value)}
-              disabled={trainingBusy || evaluationLoading || trainingStatus?.status === "running"}
-            >
-              <option value="fast">Fast</option>
-              <option value="balanced">Balanced</option>
-              <option value="best-quality">Best Quality</option>
-            </select>
-            <button type="button" onClick={startTraining} disabled={trainingBusy || evaluationLoading || isSelectedTrainingRunning}>
-              {trainingBusy || isSelectedTrainingRunning ? "Start Training (Running...)" : "Start Training"}
-            </button>
-            <button type="button" onClick={loadTrainingStatus} disabled={trainingBusy || evaluationLoading}>
-              {trainingBusy ? "Refreshing..." : "Refresh Training Status"}
-            </button>
-            <button type="button" onClick={stopTraining} disabled={evaluationLoading}>
-              Stop Training
-            </button>
-            <button type="button" onClick={() => runEvaluation(true)} disabled={evaluationLoading}>
-              {evaluationLoading ? "Running Evaluation..." : "Run / Refresh Full Evaluation"}
-            </button>
-            {/* Dataset selector hidden for fixed train->evaluation workflow.
-                Keep this block commented for easy future re-enable. */}
-            {/*
-            <select value={evaluationDataset} onChange={(e) => onDatasetChange(e.target.value)}>
-              <option value="train">Training Data</option>
-              <option value="evaluation">Evaluation Data</option>
-            </select>
-            */}
-            {/* <select value={evaluationMethod} onChange={(e) => onMethodChange(e.target.value)}>
-              <option value="all">All Methods</option>
-              <option value="deeplabv3plus">DeepLabV3+</option>
-              <option value="sam2">SAM2</option>
-              <option value="unet">U-Net</option>
-              <option value="maskrcnn">Mask R-CNN</option>
-              <option value="segformer">SegFormer</option>
-            </select> */}
-            {/* <button type="button" onClick={loadEvaluationPage} disabled={!evaluationSummary || evaluationLoading}>
-              Load Page
-            </button> */}
-          </div>
-          <details className="profile-details">
-            <summary>Profile help</summary>
-            <div className="profile-help-note">
-              <strong>Fast:</strong> least time/compute, lower final accuracy.{" "}
-              <strong>Balanced:</strong> recommended default for quality/time.{" "}
-              <strong>Best Quality:</strong> most time/compute with strongest expected accuracy.
-            </div>
-          </details>
-          <div className="profile-tip">{profileHint}</div>
-          <div className="profile-tip model-tip">{modelProfileHint}</div>
 
-          {evaluationNotice ? <div className="error">{evaluationNotice}</div> : null}
-
-          {evaluationPrecheck ? (
-            <div className="card">
-              <h2>Model Precheck</h2>
-              {Object.entries(evaluationPrecheck.methods).map(([name, status]) => (
-                <p key={`precheck-${name}`}>
-                  <strong>{name}:</strong>{" "}
-                  {status.ready_for_model_inference ? "Trained checkpoint ready" : "Fallback risk"}
-                  {status.checkpoint_path ? ` | checkpoint: ${status.checkpoint_path}` : ""}
-                </p>
-              ))}
-              {comparisonLocked ? (
-                <p><strong>Comparison:</strong> Locked for strict model comparison because at least one method is fallback.</p>
-              ) : (
-                <p><strong>Comparison:</strong> Ready for strict cross-model comparison.</p>
-              )}
-            </div>
-          ) : null}
-
-          {/* <div className="card eval-controls">
-            <button type="button" onClick={trainAllAndEvaluate} disabled={trainingBusy || evaluationLoading}>
-              {trainingBusy ? "Running All..." : "Train All + Evaluate"}
-            </button>
-            <button type="button" onClick={startTraining} disabled={trainingBusy}>
-              {trainingBusy ? "Starting..." : `Start Training (${evaluationMethod})`}
-            </button>
-            <button type="button" onClick={loadTrainingStatus} disabled={trainingBusy}>
-              {trainingBusy ? "Checking..." : `Check Training Status (${evaluationMethod})`}
-            </button>
-            <button type="button" onClick={stopTraining} disabled={trainingBusy}>
-              {trainingBusy ? "Stopping..." : `Stop Training (${evaluationMethod})`}
-            </button>
-          </div> */}
-
-          {trainingStatus ? (
-            <div className="card">
-              <h2>Training Status</h2>
-              <p><strong>Method:</strong> {trainingStatus.method}</p>
-              <p><strong>Profile:</strong> {trainingStatus.profile ?? "-"}</p>
-              <p><strong>Status:</strong> {trainingStatus.status}</p>
-              <p><strong>PID:</strong> {trainingStatus.pid ?? "-"}</p>
-              <p><strong>Return Code:</strong> {trainingStatus.return_code ?? "-"}</p>
-              <p><strong>Log:</strong> {trainingStatus.log_path}</p>
-              {trainingStatus.log_tail ? <pre className="log-tail">{trainingStatus.log_tail}</pre> : null}
-            </div>
-          ) : null}
-
-          {evaluationSummary ? (
-            <div className="card">
-              <p>
-                <strong>Train annotations:</strong> {evaluationSummary.train_annotations_path}
-              </p>
-              <p>
-                <strong>Evaluation annotations:</strong> {evaluationSummary.evaluation_annotations_path}
-              </p>
-              <p>
-                <strong>Evaluation GT available:</strong> {evaluationSummary.evaluation_has_ground_truth ? "Yes" : "No"}
-              </p>
-            </div>
-          ) : null}
-
-          {evaluationError ? <div className="error">{evaluationError}</div> : null}
-
-          <div className="grid">
-            {summaryCards.map((card) => (
-              <div className="card" key={`${evaluationDataset}-${card.method}`}>
-                <h2>{card.method}</h2>
-                <p><strong>Images:</strong> {card.num_images ?? "-"}</p>
-                {evaluationDataset === "train" ? (
-                  <>
-                    <p><strong>Accuracy:</strong> {card.accuracy ?? "-"}</p>
-                    <p><strong>Macro F1:</strong> {card.macro_f1 ?? "-"}</p>
-                    <p><strong>Macro IoU:</strong> {card.macro_iou ?? "-"}</p>
-                  </>
-                ) : (
-                  <>
-                    {card.metrics_applicable ? (
-                      <>
-                        <p><strong>Accuracy:</strong> {card.accuracy ?? "-"}</p>
-                        <p><strong>Macro F1:</strong> {card.macro_f1 ?? "-"}</p>
-                        <p><strong>Macro IoU:</strong> {card.macro_iou ?? "-"}</p>
-                      </>
-                    ) : (
-                      <>
-                        <p><strong>Avg Tree Ratio:</strong> {card.avg_tree_ratio ?? "-"}</p>
-                        <p><strong>Avg Group Ratio:</strong> {card.avg_group_ratio ?? "-"}</p>
-                      </>
-                    )}
-                  </>
-                )}
-                {card.note ? <p><strong>Note:</strong> {card.note}</p> : null}
-                <p><strong>Avg Inference (ms):</strong> {card.avg_inference_ms ?? "-"}</p>
-                <p><strong>Inference Modes:</strong> {JSON.stringify(card.inference_mode_counts || {})}</p>
-                <p><strong>Fallback Images:</strong> {card.fallback_image_count ?? "-"}</p>
-              </div>
-            ))}
-          </div>
-
-          {(evaluationDataset === "train" || selectedSummary?.metrics_applicable) && evaluationSummary ? (
-            <div className="card">
-              <h2>Confusion Matrix (Selected Method)</h2>
-              {selectedSummary?.confusion_matrix ? (
-                <table className="matrix-table">
-                  <thead>
-                    <tr>
-                      <th>GT \ Pred</th>
-                      <th>Background</th>
-                      <th>Tree</th>
-                      <th>Tree Group</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {selectedSummary.confusion_matrix.map((row, idx) => (
-                      <tr key={`cm-${idx}`}>
-                        <td>{idx === 0 ? "Background" : idx === 1 ? "Tree" : "Tree Group"}</td>
-                        {row.map((v, j) => (
-                          <td key={`cm-${idx}-${j}`}>{v}</td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : (
-                <p>Confusion matrix is not applicable for unlabeled evaluation images.</p>
-              )}
-            </div>
-          ) : null}
-
-          <div className="card">
-            <h2>Evaluation Outcomes</h2>
-            {!evaluationRowsPayload ? (
-              <p>Run evaluation and load a page to view per-image outcomes.</p>
+          <div className="card seg-legend-card">
+            <h2 className="seg-legend-heading">Class legend</h2>
+            {legendItems.length > 0 ? (
+              <ul className="seg-legend-list">
+                {legendItems.map((item) => (
+                  <li className="seg-legend-item" key={item.classId}>
+                    <span className="swatch" style={{ backgroundColor: item.color }} />
+                    <span>{item.label}</span>
+                  </li>
+                ))}
+              </ul>
             ) : (
-              <>
-                <table className="matrix-table">
-                  <thead>
-                    <tr>
-                      <th>File</th>
-                      <th>Method</th>
-                      <th>Inference</th>
-                      {isMetricsApplicableForTable ? <th>Pixel Accuracy</th> : <th>Tree Ratio</th>}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {evaluationRowsPayload.items.map((row) => (
-                      <tr key={`${row.file_name}-${row.method}`}>
-                        <td>{row.file_name}</td>
-                        <td>{row.method}</td>
-                        <td>{row.inference_mode}</td>
-                        {isMetricsApplicableForTable ? (
-                          <td>{row.pixel_accuracy ?? "-"}</td>
-                        ) : (
-                          <td>{row.tree_ratio ?? "-"}</td>
-                        )}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <div className="pager">
-                  <button
-                    type="button"
-                    disabled={evaluationRowsPayload.page <= 1 || evaluationLoading}
-                    onClick={() => setEvaluationPage((p) => Math.max(1, p - 1))}
-                  >
-                    Prev
-                  </button>
-                  <span>
-                    Page {evaluationRowsPayload.page} / {evaluationRowsPayload.total_pages}
-                  </span>
-                  <button
-                    type="button"
-                    disabled={evaluationRowsPayload.page >= evaluationRowsPayload.total_pages || evaluationLoading}
-                    onClick={() =>
-                      setEvaluationPage((p) =>
-                        Math.min(evaluationRowsPayload.total_pages, p + 1)
-                      )
-                    }
-                  >
-                    Next
-                  </button>
-                </div>
-              </>
+              <p className="seg-legend-static">
+                Background (black), individual trees (green), tree groups (yellow). Labels above update from the API after
+                a successful run.
+              </p>
             )}
           </div>
+
+          {result ? (
+            <div className="card seg-run-summary">
+              <p>
+                <strong>Architecture:</strong> {METHOD_LABELS[result.method] ?? result.method}
+              </p>
+              <p>
+                <strong>Inference:</strong> {result.inference_mode}
+              </p>
+              {result.fallback_reason ? (
+                <p className="seg-fallback-note">
+                  <strong>Note:</strong> {result.fallback_reason}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+        </section>
+      ) : (
+        <>
+          <section className="card eval-spec-panel">
+            <h2>Model comparison</h2>
+            <p className="eval-spec-lead">
+              Assessment-style summary: five architectures in fixed order, with train, validation, and test accuracy
+              (or IoU when the training job stores it). Values are read from each method&apos;s{" "}
+              <code>output/evaluation/&lt;method&gt;/training_results.json</code> after training completes.
+            </p>
+
+            <div className="eval-controls">
+              <select
+                value={trainingMethod}
+                onChange={(e) => setTrainingMethod(e.target.value)}
+                disabled={trainingBusy || trainingStatus?.status === "running"}
+              >
+                <option value="unet">U-Net</option>
+                <option value="deeplabv3plus">DeepLabV3</option>
+                <option value="maskrcnn">Mask R-CNN</option>
+                <option value="segformer">SegFormer</option>
+                <option value="sam2">SAM2 (Zero-shot)</option>
+              </select>
+              <span className="training-tier-label" title="Only the best-quality training preset is available.">
+                Best quality
+              </span>
+              <button type="button" onClick={startTraining} disabled={trainingBusy || isSelectedTrainingRunning}>
+                {trainingBusy || isSelectedTrainingRunning ? "Start Training (Running...)" : "Start Training"}
+              </button>
+              <button type="button" onClick={() => loadTrainingStatus()} disabled={trainingBusy}>
+                {trainingBusy ? "Refreshing..." : "Refresh now"}
+              </button>
+              <button type="button" onClick={stopTraining} disabled={trainingBusy}>
+                Stop Training
+              </button>
+              <button type="button" onClick={loadTrainingResults} disabled={trainingResultsLoading}>
+                {trainingResultsLoading ? "Loading..." : "Refresh accuracy table"}
+              </button>
+            </div>
+
+            <p className="profile-tip model-tip">{trainingTierNote}</p>
+
+            <div className="spec-table-wrap">
+              <table className="spec-results-table">
+                <thead>
+                  <tr>
+                    <th scope="col">CNN Architecture</th>
+                    <th scope="col">Train Accuracy</th>
+                    <th scope="col">Validation Accuracy</th>
+                    <th scope="col">Test Accuracy</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {EVALUATION_TABLE_ROWS.map(({ key, label }) => {
+                    const r = trainingResults ? trainingResults[key] : null;
+                    const fmt = (v) => {
+                      if (v === null || v === undefined) return "";
+                      return `${(Number(v) * 100).toFixed(2)}%`;
+                    };
+                    if (!r) {
+                      return (
+                        <tr key={key}>
+                          <th scope="row">{label}</th>
+                          <td colSpan={3} className="spec-empty-row">
+                            Not trained yet
+                          </td>
+                        </tr>
+                      );
+                    }
+                    const metricNote = r.metric_type === "iou" ? " (IoU)" : "";
+                    return (
+                      <tr key={key}>
+                        <th scope="row">
+                          <span className="spec-arch-name">{label}</span>
+                          {metricNote ? <span className="metric-note spec-metric-note">{metricNote}</span> : null}
+                        </th>
+                        <td className={r.train_accuracy != null ? "acc-cell" : ""}>{fmt(r.train_accuracy) || "—"}</td>
+                        <td className={r.val_accuracy != null ? "acc-cell" : ""}>{fmt(r.val_accuracy) || "—"}</td>
+                        <td className={r.test_accuracy != null ? "acc-cell" : ""}>{fmt(r.test_accuracy) || "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <p className="eval-spec-footnote">
+              The accuracy table updates when a run first reaches completed or failed. You can still use{" "}
+              <strong>Refresh accuracy table</strong> anytime. SAM2 is listed as in the spec; after fine-tuning, the same
+              row shows metrics from the latest run.
+            </p>
+
+            {evaluationError ? <div className="error">{evaluationError}</div> : null}
+
+            <details className="card training-status-details">
+              <summary className="training-status-summary">Training status and logs</summary>
+              <p className="training-auto-refresh-hint">
+                Status and log tail refresh automatically about every {TRAINING_STATUS_POLL_MS / 1000}s for the selected
+                architecture while this tab is open. Use Refresh now for an immediate pull.
+              </p>
+              <div className="training-status-inner">
+                {trainingStatus ? (
+                  <>
+                    <p>
+                      <strong>Method:</strong> {trainingStatus.method}
+                    </p>
+                    <p>
+                      <strong>Profile:</strong> {trainingStatus.profile ?? "—"}
+                    </p>
+                    <p>
+                      <strong>Status:</strong> {trainingStatus.status}
+                    </p>
+                    <p>
+                      <strong>PID:</strong> {trainingStatus.pid ?? "—"}
+                    </p>
+                    <p>
+                      <strong>Return code:</strong> {trainingStatus.return_code ?? "—"}
+                    </p>
+                    <p>
+                      <strong>Log:</strong> {trainingStatus.log_path}
+                    </p>
+                    {trainingStatus.log_tail ? <pre className="log-tail">{trainingStatus.log_tail}</pre> : null}
+                  </>
+                ) : (
+                  <p className="training-status-empty">No status loaded yet. Start training or use Refresh Training Status.</p>
+                )}
+              </div>
+            </details>
+          </section>
         </>
       )}
     </div>

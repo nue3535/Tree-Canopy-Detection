@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,11 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     def tqdm(x, **kwargs):
         return x
+
+try:
+    from backend.scripts.training_utils import CombinedLoss, EarlyStopping, apply_augmentation
+except ImportError:
+    from training_utils import CombinedLoss, EarlyStopping, apply_augmentation
 
 
 SUPPORTED_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
@@ -79,17 +85,18 @@ class TrainConfig:
     annotations_path: Path
     image_dir: Path
     save_dir: Path
-    img_size: int = 640
-    batch_size: int = 4
+    img_size: int = 1024
+    batch_size: int = 8
     epochs: int = 30
-    lr: float = 2e-4
+    lr: float = 1e-4
     workers: int = 0
 
 
 class SemanticDataset(Dataset):
-    def __init__(self, records: list[dict], img_size: int) -> None:
+    def __init__(self, records: list[dict], img_size: int, training: bool = True) -> None:
         self.records = records
         self.img_size = img_size
+        self.training = training
 
     def __len__(self) -> int:
         return len(self.records)
@@ -103,7 +110,8 @@ class SemanticDataset(Dataset):
         mask = record["mask"]
         image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
-
+        if self.training:
+            image, mask = apply_augmentation(image, mask)
         image_t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
         mask_t = torch.from_numpy(mask).long()
         return image_t, mask_t
@@ -139,7 +147,7 @@ def _load_records(config: TrainConfig) -> tuple[list[dict], list[dict]]:
     if not train_records:
         raise RuntimeError("No training records found for U-Net.")
     if not val_records:
-        n_val = max(1, int(0.15 * len(train_records)))
+        n_val = max(1, int(0.20 * len(train_records)))
         val_records = train_records[:n_val]
         train_records = train_records[n_val:]
     return train_records, val_records
@@ -167,6 +175,68 @@ def _predict_mask(model: torch.nn.Module, image_bgr: np.ndarray, img_size: int, 
         pred_small = torch.argmax(logits, dim=1)[0].detach().cpu().numpy().astype(np.uint8)
     pred = cv2.resize(pred_small, (image_bgr.shape[1], image_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
     return pred
+
+
+def _resolve_eval_image_dir(project_root: Path) -> Path:
+    candidates = [
+        project_root / "data" / "raw" / "evaluation_images",
+        project_root / "data" / "raw" / "evaluation_images_tif",
+        project_root / "data" / "raw" / "evaluation_images_png",
+    ]
+    first_existing = None
+    for path in candidates:
+        if path.exists() and path.is_dir():
+            if first_existing is None:
+                first_existing = path
+            if any(p.suffix.lower() in SUPPORTED_SUFFIXES for p in path.iterdir() if p.is_file()):
+                return path
+    return first_existing or candidates[0]
+
+
+def _compute_pixel_accuracy(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, masks in loader:
+            images, masks = images.to(device), masks.to(device)
+            pred = torch.argmax(model(images), dim=1)
+            correct += int((pred == masks).sum().item())
+            total += int(masks.numel())
+    return round(correct / max(1, total), 6)
+
+
+def _compute_test_accuracy(
+    model: torch.nn.Module, config: TrainConfig, device: torch.device,
+) -> float | None:
+    eval_annot = config.project_root / "data" / "raw" / "annotations" / "evaluation_annotations.json"
+    if not eval_annot.exists():
+        return None
+    try:
+        payload = json.loads(eval_annot.read_text(encoding="utf-8"))
+        records: list[dict] = []
+        eval_image_dir = _resolve_eval_image_dir(config.project_root)
+        for img_info in payload.get("images", []):
+            stem = Path(img_info.get("file_name", "")).stem
+            if not stem:
+                continue
+            img_path = _find_image_path(eval_image_dir, stem)
+            if img_path is None:
+                continue
+            w, h = int(img_info.get("width", 0)), int(img_info.get("height", 0))
+            if w <= 0 or h <= 0:
+                continue
+            mask = _polygon_mask(w, h, img_info.get("annotations", []))
+            records.append({"image_path": img_path, "mask": mask})
+        if not records:
+            return None
+        loader = DataLoader(
+            SemanticDataset(records, config.img_size),
+            batch_size=config.batch_size, shuffle=False, num_workers=0,
+        )
+        return _compute_pixel_accuracy(model, loader, device)
+    except Exception:
+        return None
 
 
 def _save_evaluation_artifacts(
@@ -286,13 +356,13 @@ def train(config: TrainConfig) -> None:
         flush=True,
     )
     train_loader = DataLoader(
-        SemanticDataset(train_records, config.img_size),
+        SemanticDataset(train_records, config.img_size, training=True),
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.workers,
     )
     val_loader = DataLoader(
-        SemanticDataset(val_records, config.img_size),
+        SemanticDataset(val_records, config.img_size, training=False),
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.workers,
@@ -300,13 +370,14 @@ def train(config: TrainConfig) -> None:
 
     model = smp.Unet(
         encoder_name="resnet34",
-        encoder_weights=None,
+        encoder_weights="imagenet",
         in_channels=3,
         classes=3,
         activation=None,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = CombinedLoss(num_classes=3)
+    early_stopping = EarlyStopping(patience=10)
 
     best_iou = -1.0
     for epoch in range(config.epochs):
@@ -361,9 +432,42 @@ def train(config: TrainConfig) -> None:
                 config.save_dir / "best_model.pth",
             )
             print(f"[U-Net] saved best checkpoint: {config.save_dir / 'best_model.pth'}", flush=True)
+        if early_stopping.should_stop(mean_iou):
+            print(f"[U-Net] early stopping at epoch {epoch+1}", flush=True)
+            break
 
     torch.save({"model_state_dict": model.state_dict()}, config.save_dir / "final_model.pth")
     print(f"[U-Net] complete. Best IoU={best_iou:.4f}. Saved to {config.save_dir}", flush=True)
+
+    print("[U-Net] Computing training results...", flush=True)
+    train_eval_loader = DataLoader(
+        SemanticDataset(train_records, config.img_size, training=False),
+        batch_size=config.batch_size, shuffle=False, num_workers=config.workers,
+    )
+    train_acc = _compute_pixel_accuracy(model, train_eval_loader, device)
+    val_acc = _compute_pixel_accuracy(model, val_loader, device)
+    test_acc = _compute_test_accuracy(model, config, device)
+    eval_root = config.project_root / "output" / "evaluation" / "unet"
+    eval_root.mkdir(parents=True, exist_ok=True)
+    training_results = {
+        "method": "unet",
+        "train_accuracy": train_acc,
+        "val_accuracy": val_acc,
+        "test_accuracy": test_acc,
+        "best_val_iou": round(best_iou, 6),
+        "final_train_loss": round(running_loss / max(1, len(train_loader)), 6),
+        "epochs": config.epochs,
+        "timestamp": int(time.time()),
+    }
+    (eval_root / "training_results.json").write_text(
+        json.dumps(training_results, indent=2), encoding="utf-8",
+    )
+    print(
+        f"[U-Net] Results: train_acc={train_acc:.4f} val_acc={val_acc:.4f}"
+        f" test_acc={test_acc if test_acc is not None else 'N/A'}",
+        flush=True,
+    )
+
     _save_evaluation_artifacts(model, val_records, config, device)
 
 
@@ -371,9 +475,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="U-Net training workflow")
     parser.add_argument("action", choices=["train"], default="train")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--img-size", type=int, default=640)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--img-size", type=int, default=1024)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--workers", type=int, default=0)
     return parser.parse_args()
 

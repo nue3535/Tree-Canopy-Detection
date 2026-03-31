@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +21,11 @@ try:
     from transformers import SegformerConfig, SegformerForSemanticSegmentation, SegformerImageProcessor
 except Exception as exc:  # pragma: no cover - runtime environment dependent
     raise RuntimeError("transformers is required for SegFormer training.") from exc
+
+try:
+    from backend.scripts.training_utils import CombinedLoss, EarlyStopping, apply_augmentation
+except ImportError:
+    from training_utils import CombinedLoss, EarlyStopping, apply_augmentation
 
 
 SUPPORTED_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
@@ -77,17 +83,18 @@ class TrainConfig:
     annotations_path: Path
     image_dir: Path
     save_dir: Path
-    img_size: int = 512
-    batch_size: int = 4
+    img_size: int = 1024
+    batch_size: int = 8
     epochs: int = 20
-    lr: float = 6e-5
+    lr: float = 1e-4
     workers: int = 0
 
 
 class SegFormerDataset(Dataset):
-    def __init__(self, records: list[dict], img_size: int):
+    def __init__(self, records: list[dict], img_size: int, training: bool = True):
         self.records = records
         self.img_size = img_size
+        self.training = training
 
     def __len__(self) -> int:
         return len(self.records)
@@ -101,6 +108,8 @@ class SegFormerDataset(Dataset):
         mask = record["mask"]
         image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+        if self.training:
+            image, mask = apply_augmentation(image, mask)
         image_t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
         mask_t = torch.from_numpy(mask).long()
         return image_t, mask_t
@@ -136,7 +145,7 @@ def _load_records(config: TrainConfig) -> tuple[list[dict], list[dict]]:
     if not train_records:
         raise RuntimeError("No training records found for SegFormer.")
     if not val_records:
-        n_val = max(1, int(0.15 * len(train_records)))
+        n_val = max(1, int(0.20 * len(train_records)))
         val_records = train_records[:n_val]
         train_records = train_records[n_val:]
     return train_records, val_records
@@ -153,6 +162,74 @@ def _mean_iou(pred: torch.Tensor, target: torch.Tensor, num_classes: int = 3) ->
         union = np.logical_or(pred_c, target_c).sum()
         ious.append(float(inter) / float(union + 1e-6))
     return float(np.mean(ious))
+
+
+def _resolve_eval_image_dir(project_root: Path) -> Path:
+    candidates = [
+        project_root / "data" / "raw" / "evaluation_images",
+        project_root / "data" / "raw" / "evaluation_images_tif",
+        project_root / "data" / "raw" / "evaluation_images_png",
+    ]
+    first_existing = None
+    for path in candidates:
+        if path.exists() and path.is_dir():
+            if first_existing is None:
+                first_existing = path
+            if any(p.suffix.lower() in SUPPORTED_SUFFIXES for p in path.iterdir() if p.is_file()):
+                return path
+    return first_existing or candidates[0]
+
+
+def _compute_pixel_accuracy(
+    model: torch.nn.Module, loader: DataLoader, device: torch.device,
+) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, masks in loader:
+            images, masks = images.to(device), masks.to(device)
+            logits = model(pixel_values=images).logits
+            logits = torch.nn.functional.interpolate(
+                logits, size=masks.shape[-2:], mode="bilinear", align_corners=False,
+            )
+            pred = torch.argmax(logits, dim=1)
+            correct += int((pred == masks).sum().item())
+            total += int(masks.numel())
+    return round(correct / max(1, total), 6)
+
+
+def _compute_test_accuracy(
+    model: torch.nn.Module, config: TrainConfig, device: torch.device,
+) -> float | None:
+    eval_annot = config.project_root / "data" / "raw" / "annotations" / "evaluation_annotations.json"
+    if not eval_annot.exists():
+        return None
+    try:
+        payload = json.loads(eval_annot.read_text(encoding="utf-8"))
+        records: list[dict] = []
+        eval_image_dir = _resolve_eval_image_dir(config.project_root)
+        for img_info in payload.get("images", []):
+            stem = Path(img_info.get("file_name", "")).stem
+            if not stem:
+                continue
+            img_path = _find_image_path(eval_image_dir, stem)
+            if img_path is None:
+                continue
+            w, h = int(img_info.get("width", 0)), int(img_info.get("height", 0))
+            if w <= 0 or h <= 0:
+                continue
+            mask = _polygon_mask(w, h, img_info.get("annotations", []))
+            records.append({"image_path": img_path, "mask": mask})
+        if not records:
+            return None
+        loader = DataLoader(
+            SegFormerDataset(records, config.img_size),
+            batch_size=config.batch_size, shuffle=False, num_workers=0,
+        )
+        return _compute_pixel_accuracy(model, loader, device)
+    except Exception:
+        return None
 
 
 def _predict_mask(model: torch.nn.Module, image_bgr: np.ndarray, img_size: int, device: torch.device) -> np.ndarray:
@@ -284,26 +361,35 @@ def train(config: TrainConfig) -> None:
         flush=True,
     )
     train_loader = DataLoader(
-        SegFormerDataset(train_records, config.img_size),
+        SegFormerDataset(train_records, config.img_size, training=True),
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.workers,
     )
     val_loader = DataLoader(
-        SegFormerDataset(val_records, config.img_size),
+        SegFormerDataset(val_records, config.img_size, training=False),
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.workers,
     )
 
-    model_cfg = SegformerConfig(
-        num_labels=3,
-        hidden_sizes=[64, 128, 320, 512],
-        depths=[2, 2, 2, 2],
-        decoder_hidden_size=256,
-        reshape_last_stage=True,
-    )
-    model = SegformerForSemanticSegmentation(model_cfg).to(device)
+    try:
+        model = SegformerForSemanticSegmentation.from_pretrained(
+            "nvidia/segformer-b0-finetuned-ade-512-512",
+            num_labels=3,
+            ignore_mismatched_sizes=True,
+        ).to(device)
+        print("[SegFormer] loaded pretrained weights (transfer learning)", flush=True)
+    except Exception:
+        model_cfg = SegformerConfig(
+            num_labels=3,
+            hidden_sizes=[64, 128, 320, 512],
+            depths=[2, 2, 2, 2],
+            decoder_hidden_size=256,
+            reshape_last_stage=True,
+        )
+        model = SegformerForSemanticSegmentation(model_cfg).to(device)
+        print("[SegFormer] pretrained unavailable, training from scratch", flush=True)
     processor = SegformerImageProcessor(
         do_resize=True,
         size={"height": config.img_size, "width": config.img_size},
@@ -311,6 +397,8 @@ def train(config: TrainConfig) -> None:
         do_normalize=False,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
+    criterion = CombinedLoss(num_classes=3)
+    early_stopping = EarlyStopping(patience=10)
 
     best_iou = -1.0
     for epoch in range(config.epochs):
@@ -319,8 +407,11 @@ def train(config: TrainConfig) -> None:
         for batch_idx, (images, masks) in enumerate(pbar, start=1):
             images = images.to(device)
             masks = masks.to(device)
-            outputs = model(pixel_values=images, labels=masks)
-            loss = outputs.loss
+            logits = model(pixel_values=images).logits
+            logits_up = torch.nn.functional.interpolate(
+                logits, size=masks.shape[-2:], mode="bilinear", align_corners=False,
+            )
+            loss = criterion(logits_up, masks)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -359,8 +450,40 @@ def train(config: TrainConfig) -> None:
             model.save_pretrained(str(config.save_dir))
             processor.save_pretrained(str(config.save_dir))
             print(f"[SegFormer] saved best checkpoint to {config.save_dir}", flush=True)
+        if early_stopping.should_stop(mean_iou):
+            print(f"[SegFormer] early stopping at epoch {epoch+1}", flush=True)
+            break
 
     print(f"[SegFormer] complete. Best IoU={best_iou:.4f}. Saved to {config.save_dir}", flush=True)
+
+    print("[SegFormer] Computing training results...", flush=True)
+    train_eval_loader = DataLoader(
+        SegFormerDataset(train_records, config.img_size, training=False),
+        batch_size=config.batch_size, shuffle=False, num_workers=config.workers,
+    )
+    train_acc = _compute_pixel_accuracy(model, train_eval_loader, device)
+    val_acc = _compute_pixel_accuracy(model, val_loader, device)
+    test_acc = _compute_test_accuracy(model, config, device)
+    eval_root = config.project_root / "output" / "evaluation" / "segformer"
+    eval_root.mkdir(parents=True, exist_ok=True)
+    training_results = {
+        "method": "segformer",
+        "train_accuracy": train_acc,
+        "val_accuracy": val_acc,
+        "test_accuracy": test_acc,
+        "best_val_iou": round(best_iou, 6),
+        "epochs": config.epochs,
+        "timestamp": int(time.time()),
+    }
+    (eval_root / "training_results.json").write_text(
+        json.dumps(training_results, indent=2), encoding="utf-8",
+    )
+    print(
+        f"[SegFormer] Results: train_acc={train_acc:.4f} val_acc={val_acc:.4f}"
+        f" test_acc={test_acc if test_acc is not None else 'N/A'}",
+        flush=True,
+    )
+
     _save_evaluation_artifacts(model, val_records, config, device)
 
 
@@ -368,9 +491,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SegFormer training workflow")
     parser.add_argument("action", choices=["train"], default="train")
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--img-size", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=6e-5)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--img-size", type=int, default=1024)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--workers", type=int, default=0)
     return parser.parse_args()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -24,6 +25,23 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     def tqdm(x, **kwargs):
         return x
+
+try:
+    from backend.scripts.training_utils import (
+        DiceFocalSegLoss,
+        EarlyStopping,
+        apply_augmentation,
+        make_deeplab_notebook_train_transform,
+        make_deeplab_notebook_val_transform,
+    )
+except ImportError:
+    from training_utils import (
+        DiceFocalSegLoss,
+        EarlyStopping,
+        apply_augmentation,
+        make_deeplab_notebook_train_transform,
+        make_deeplab_notebook_val_transform,
+    )
 
 
 SUPPORTED_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
@@ -101,12 +119,20 @@ class DeepLabV3PlusConfig:
     TRAIN_SPLIT_TXT: Path | None = None
     VAL_SPLIT_TXT: Path | None = None
 
+    # Defaults aligned with DeepLabV3Plus/tree_segmentation_training.ipynb (A100Config)
     IMG_SIZE: int = 640
-    BATCH_SIZE: int = 4
-    NUM_EPOCHS: int = 60
-    LEARNING_RATE: float = 1e-4
-    NUM_WORKERS: int = 0
-    ENCODER_NAME: str = "resnet34"
+    BATCH_SIZE: int = 6
+    NUM_EPOCHS: int = 100
+    LEARNING_RATE: float = 9e-5
+    NUM_WORKERS: int = 4
+    ENCODER_NAME: str = "timm-resnest50d"
+    ENCODER_DEPTH: int = 4
+    DECODER_CHANNELS: int = 128
+    WEIGHT_DECAY: float = 5e-4
+    ACCUMULATION_STEPS: int = 3
+    WARMUP_EPOCHS: int = 10
+    EARLY_STOPPING_PATIENCE: int = 30
+    AUGMENT_STYLE: str = "notebook"  # "notebook" (Albumentations + ImageNet norm) or "opencv"
 
     def __post_init__(self) -> None:
         if self.ANNOTATIONS_PATH is None:
@@ -125,9 +151,20 @@ class DeepLabV3PlusConfig:
             self.VAL_SPLIT_TXT = self.PROJECT_DIR / "data" / "processed" / "val.txt"
 
 class SemanticDataset(Dataset):
-    def __init__(self, records: list[dict], img_size: int):
+    def __init__(
+        self,
+        records: list[dict],
+        img_size: int,
+        training: bool = True,
+        augment_style: str = "notebook",
+    ):
         self.records = records
         self.img_size = img_size
+        self.training = training
+        self.augment_style = augment_style
+        if augment_style == "notebook":
+            self._train_tf = make_deeplab_notebook_train_transform(img_size)
+            self._val_tf = make_deeplab_notebook_val_transform(img_size)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -138,9 +175,23 @@ class SemanticDataset(Dataset):
         if image is None:
             raise FileNotFoundError(f"Could not read image: {record['image_path']}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mask = record["mask"]
+        mask = record["mask"].astype(np.uint8)
+
+        if self.augment_style == "notebook":
+            if self.training:
+                out = self._train_tf(image=image, mask=mask)
+            else:
+                out = self._val_tf(image=image, mask=mask)
+            m = out["mask"]
+            if m.dtype != torch.long:
+                m = m.long()
+            m = torch.clamp(m, 0, 2)
+            return out["image"], m
+
         image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+        if self.training:
+            image, mask = apply_augmentation(image, mask)
         image_t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
         mask_t = torch.from_numpy(mask).long()
         return image_t, mask_t
@@ -183,20 +234,37 @@ def _load_records(config: DeepLabV3PlusConfig) -> tuple[list[dict], list[dict]]:
     if not train_records:
         raise RuntimeError("No training records found for DeepLabV3+.")
     if not val_records:
-        n_val = max(1, int(0.15 * len(train_records)))
+        n_val = max(1, int(0.20 * len(train_records)))
         val_records = train_records[:n_val]
         train_records = train_records[n_val:]
     return train_records, val_records
 
 
 def _build_model(config: DeepLabV3PlusConfig) -> torch.nn.Module:
-    return smp.DeepLabV3Plus(
+    kwargs = dict(
         encoder_name=config.ENCODER_NAME,
-        encoder_weights=None,
+        encoder_weights="imagenet",
         in_channels=3,
         classes=3,
         activation=None,
+        encoder_depth=config.ENCODER_DEPTH,
+        decoder_channels=config.DECODER_CHANNELS,
     )
+    try:
+        return smp.DeepLabV3Plus(**kwargs)
+    except Exception as exc:
+        print(
+            f"[DeepLabV3+] WARN: could not build encoder {config.ENCODER_NAME} ({exc}); "
+            "falling back to resnet34.",
+            flush=True,
+        )
+        return smp.DeepLabV3Plus(
+            encoder_name="resnet34",
+            encoder_weights="imagenet",
+            in_channels=3,
+            classes=3,
+            activation=None,
+        )
 
 
 def _mean_iou(pred: torch.Tensor, target: torch.Tensor, num_classes: int = 3) -> float:
@@ -212,10 +280,18 @@ def _mean_iou(pred: torch.Tensor, target: torch.Tensor, num_classes: int = 3) ->
     return float(np.mean(ious))
 
 
-def get_transform(img_size: int = 640) -> Callable[[np.ndarray], torch.Tensor]:
+def get_transform(img_size: int = 640, imagenet_norm: bool = True) -> Callable[[np.ndarray], torch.Tensor]:
+    """Preprocess for DeepLab input: resize to img_size; optionally ImageNet norm (notebook / default training)."""
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.224]).view(3, 1, 1)
+
     def _transform(image_rgb: np.ndarray) -> torch.Tensor:
         resized = cv2.resize(image_rgb, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
-        return torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
+        t = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
+        if imagenet_norm:
+            return (t - mean) / std
+        return t
+
     return _transform
 
 
@@ -261,7 +337,7 @@ def _save_evaluation_artifacts(
     cm = np.zeros((3, 3), dtype=np.int64)
     image_ious: list[float] = []
     tp_like_ious: list[float] = []
-    transform = get_transform(config.IMG_SIZE)
+    transform = get_transform(config.IMG_SIZE, imagenet_norm=config.AUGMENT_STYLE == "notebook")
 
     for idx, record in enumerate(val_records, start=1):
         image_path = record["image_path"]
@@ -349,6 +425,58 @@ def _save_evaluation_artifacts(
     print(f"[DeepLabV3+] evaluation artifacts saved to {eval_root}", flush=True)
 
 
+def _compute_pixel_accuracy(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, masks in loader:
+            images, masks = images.to(device), masks.to(device)
+            pred = torch.argmax(model(images), dim=1)
+            correct += int((pred == masks).sum().item())
+            total += int(masks.numel())
+    return round(correct / max(1, total), 6)
+
+
+def _compute_test_accuracy(
+    model: torch.nn.Module, config: DeepLabV3PlusConfig, device: torch.device,
+) -> float | None:
+    eval_annot = config.PROJECT_DIR / "data" / "raw" / "annotations" / "evaluation_annotations.json"
+    if not eval_annot.exists():
+        return None
+    try:
+        payload = json.loads(eval_annot.read_text(encoding="utf-8"))
+        records: list[dict] = []
+        for img_info in payload.get("images", []):
+            stem = Path(img_info.get("file_name", "")).stem
+            if not stem:
+                continue
+            img_path = _find_image_path(config.EVAL_IMAGE_DIR, stem)
+            if img_path is None:
+                continue
+            w, h = int(img_info.get("width", 0)), int(img_info.get("height", 0))
+            if w <= 0 or h <= 0:
+                continue
+            mask = _polygon_mask(w, h, img_info.get("annotations", []))
+            records.append({"image_path": img_path, "mask": mask})
+        if not records:
+            return None
+        loader = DataLoader(
+            SemanticDataset(
+                records,
+                config.IMG_SIZE,
+                training=False,
+                augment_style=config.AUGMENT_STYLE,
+            ),
+            batch_size=config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=0,
+        )
+        return _compute_pixel_accuracy(model, loader, device)
+    except Exception:
+        return None
+
+
 def train(config: DeepLabV3PlusConfig) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -362,36 +490,63 @@ def train(config: DeepLabV3PlusConfig) -> None:
     )
 
     train_loader = DataLoader(
-        SemanticDataset(train_records, config.IMG_SIZE),
+        SemanticDataset(
+            train_records,
+            config.IMG_SIZE,
+            training=True,
+            augment_style=config.AUGMENT_STYLE,
+        ),
         batch_size=config.BATCH_SIZE,
         shuffle=True,
         num_workers=config.NUM_WORKERS,
     )
     val_loader = DataLoader(
-        SemanticDataset(val_records, config.IMG_SIZE),
+        SemanticDataset(
+            val_records,
+            config.IMG_SIZE,
+            training=False,
+            augment_style=config.AUGMENT_STYLE,
+        ),
         batch_size=config.BATCH_SIZE,
         shuffle=False,
         num_workers=config.NUM_WORKERS,
     )
 
     model = _build_model(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=1e-4)
-    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.LEARNING_RATE,
+        weight_decay=config.WEIGHT_DECAY,
+    )
+    criterion = DiceFocalSegLoss(num_classes=3)
+    early_stopping = EarlyStopping(patience=config.EARLY_STOPPING_PATIENCE)
+
+    def _lr_lambda(ep: int) -> float:
+        if ep < config.WARMUP_EPOCHS:
+            return float(ep + 1) / float(max(1, config.WARMUP_EPOCHS))
+        denom = max(1, config.NUM_EPOCHS - config.WARMUP_EPOCHS)
+        progress = float(ep - config.WARMUP_EPOCHS) / float(denom)
+        return 0.5 * (1.0 + float(np.cos(np.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+    accum = max(1, int(config.ACCUMULATION_STEPS))
 
     best_iou = -1.0
     for epoch in range(config.NUM_EPOCHS):
         model.train()
         running_loss = 0.0
+        optimizer.zero_grad(set_to_none=True)
         pbar = tqdm(train_loader, desc=f"[DeepLabV3+][Train] epoch {epoch + 1}/{config.NUM_EPOCHS}", dynamic_ncols=True)
         for batch_idx, (images, masks) in enumerate(pbar, start=1):
             images = images.to(device)
             masks = masks.to(device)
             logits = model(images)
-            loss = criterion(logits, masks)
-            optimizer.zero_grad()
+            loss = criterion(logits, masks) / float(accum)
             loss.backward()
-            optimizer.step()
-            running_loss += float(loss.detach().cpu().item())
+            running_loss += float(loss.detach().cpu().item()) * float(accum)
+            if batch_idx % accum == 0 or batch_idx == len(train_loader):
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             pbar.set_postfix(loss=f"{running_loss / max(1, batch_idx):.4f}")
             if batch_idx % 5 == 0 or batch_idx == len(train_loader):
                 print(
@@ -399,6 +554,7 @@ def train(config: DeepLabV3PlusConfig) -> None:
                     f"batch={batch_idx}/{len(train_loader)} loss={running_loss / max(1, batch_idx):.4f}",
                     flush=True,
                 )
+        scheduler.step()
 
         model.eval()
         val_ious = []
@@ -422,9 +578,47 @@ def train(config: DeepLabV3PlusConfig) -> None:
                 config.SAVE_DIR / "best_model_fold0.pth",
             )
             print(f"[DeepLabV3+] saved best checkpoint: {config.SAVE_DIR / 'best_model_fold0.pth'}", flush=True)
+        if early_stopping.should_stop(mean_iou):
+            print(f"[DeepLabV3+] early stopping at epoch {epoch+1}", flush=True)
+            break
 
     torch.save({"model_state_dict": model.state_dict()}, config.SAVE_DIR / "final_model.pth")
     print(f"[DeepLabV3+] complete. Best IoU={best_iou:.4f}. Saved to {config.SAVE_DIR}", flush=True)
+
+    print("[DeepLabV3+] Computing training results...", flush=True)
+    train_eval_loader = DataLoader(
+        SemanticDataset(
+            train_records,
+            config.IMG_SIZE,
+            training=False,
+            augment_style=config.AUGMENT_STYLE,
+        ),
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+    )
+    train_acc = _compute_pixel_accuracy(model, train_eval_loader, device)
+    val_acc = _compute_pixel_accuracy(model, val_loader, device)
+    test_acc = _compute_test_accuracy(model, config, device)
+    training_results = {
+        "method": "deeplabv3plus",
+        "train_accuracy": train_acc,
+        "val_accuracy": val_acc,
+        "test_accuracy": test_acc,
+        "best_val_iou": round(best_iou, 6),
+        "final_train_loss": round(running_loss / max(1, len(train_loader)), 6),
+        "epochs": config.NUM_EPOCHS,
+        "timestamp": int(time.time()),
+        "config_note": "Aligned with tree_segmentation_training.ipynb (A100Config); loss = 0.5*Dice+0.5*Focal.",
+    }
+    results_path = config.OUTPUT_DIR / "training_results.json"
+    results_path.write_text(json.dumps(training_results, indent=2), encoding="utf-8")
+    print(
+        f"[DeepLabV3+] Results: train_acc={train_acc:.4f} val_acc={val_acc:.4f}"
+        f" test_acc={test_acc if test_acc is not None else 'N/A'}",
+        flush=True,
+    )
+
     _save_evaluation_artifacts(model, val_records, config, device)
 
 
@@ -459,7 +653,7 @@ def evaluate(config: DeepLabV3PlusConfig) -> None:
 def run_predict(config: DeepLabV3PlusConfig, num_images: int = 6) -> None:
     ensure_output_dirs(config)
     model, device, _ = load_best_model(config)
-    transform = get_transform(config.IMG_SIZE)
+    transform = get_transform(config.IMG_SIZE, imagenet_norm=config.AUGMENT_STYLE == "notebook")
     image_paths = []
     for suffix in SUPPORTED_SUFFIXES:
         image_paths.extend(config.EVAL_IMAGE_DIR.glob(f"*{suffix}"))
@@ -485,11 +679,23 @@ def run_predict(config: DeepLabV3PlusConfig, num_images: int = 6) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeepLabV3+ workflow")
     parser.add_argument("action", choices=["train", "evaluate", "predict"], default="train")
-    parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=6)
     parser.add_argument("--img-size", type=int, default=640)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=9e-5)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--encoder-name", type=str, default="timm-resnest50d")
+    parser.add_argument("--accum-steps", type=int, default=3)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument("--warmup-epochs", type=int, default=10)
+    parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument(
+        "--augment-style",
+        type=str,
+        choices=["notebook", "opencv"],
+        default="notebook",
+        help="notebook: Albumentations + ImageNet norm (Colab notebook). opencv: legacy resize + simple aug.",
+    )
     parser.add_argument("--num-images", type=int, default=6)
     return parser.parse_args()
 
@@ -502,6 +708,12 @@ def main() -> None:
         IMG_SIZE=args.img_size,
         LEARNING_RATE=args.lr,
         NUM_WORKERS=args.workers,
+        ENCODER_NAME=args.encoder_name,
+        ACCUMULATION_STEPS=args.accum_steps,
+        WEIGHT_DECAY=args.weight_decay,
+        WARMUP_EPOCHS=args.warmup_epochs,
+        EARLY_STOPPING_PATIENCE=args.patience,
+        AUGMENT_STYLE=args.augment_style,
     )
     if args.action == "train":
         train(config)

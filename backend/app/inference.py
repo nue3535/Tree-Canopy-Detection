@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -48,6 +49,7 @@ from backend.scripts.deeplab_v3plus_workflow import (
     predict_image,
 )
 
+logger = logging.getLogger(__name__)
 
 SCENE_LABELS = [
     "agriculture_plantation",
@@ -162,6 +164,27 @@ def _resolve_sam2_assets(root: Path) -> tuple[Path | None, Path | None]:
     return cfg, ckpt
 
 
+def _sam2_finetuned_state_path(root: Path) -> Path:
+    """Weights saved by `sam2_workflow` after training (`torch.save(model.state_dict(), ...)`)."""
+    return root / "checkpoints_sam2" / "model.torch"
+
+
+def _load_sam2_finetuned_state_dict(sam2_model: torch.nn.Module, path: Path) -> None:
+    """Load fine-tuned state on top of the SAM2 model built from the official checkpoint."""
+    blob = torch.load(str(path), map_location="cpu")
+    if isinstance(blob, dict) and "model_state_dict" in blob:
+        state = blob["model_state_dict"]
+    elif isinstance(blob, dict) and "state_dict" in blob:
+        state = blob["state_dict"]
+    elif isinstance(blob, dict):
+        state = blob
+    else:
+        raise TypeError("SAM2 fine-tuned file must contain a state dict or wrapped checkpoint dict")
+    if not isinstance(state, dict):
+        raise TypeError("SAM2 fine-tuned state is not a mapping")
+    sam2_model.load_state_dict(state, strict=False)
+
+
 def get_method_precheck(project_root: Path | None = None) -> dict[str, dict]:
     root = project_root or Path(__file__).resolve().parents[2]
 
@@ -174,6 +197,7 @@ def get_method_precheck(project_root: Path | None = None) -> dict[str, dict]:
     sam2_dependency_ok = build_sam2 is not None and SAM2ImagePredictor is not None
     sam2_cfg, sam2_ckpt = _resolve_sam2_assets(root)
     sam2_assets_ok = sam2_cfg is not None and sam2_ckpt is not None
+    sam2_finetuned_path = _sam2_finetuned_state_path(root)
 
     unet_candidates = [
         root / "checkpoints_unet" / "best_model.pth",
@@ -208,6 +232,7 @@ def get_method_precheck(project_root: Path | None = None) -> dict[str, dict]:
         "sam2": {
             "checkpoint_found": sam2_assets_ok,
             "checkpoint_path": str(sam2_ckpt) if sam2_ckpt else "",
+            "finetuned_weights_path": str(sam2_finetuned_path) if sam2_finetuned_path.is_file() else "",
             "dependency_ok": sam2_dependency_ok,
             "ready_for_model_inference": sam2_dependency_ok and sam2_assets_ok,
             "reason": "" if (sam2_dependency_ok and sam2_assets_ok) else "SAM2 dependency/config/checkpoint missing.",
@@ -379,7 +404,10 @@ class DeepLabSegmentationService:
             self._fallback_reason = (
                 "DeepLab checkpoint unavailable; using fallback vegetation segmentation."
             )
-        self._transform = get_transform(img_size=self._config.IMG_SIZE)
+        self._transform = get_transform(
+            img_size=self._config.IMG_SIZE,
+            imagenet_norm=self._config.AUGMENT_STYLE == "notebook",
+        )
         self._loaded = True
 
     def _predict_components(self, image_bytes: bytes, filename: str) -> tuple[Image.Image, np.ndarray, int, str, str]:
@@ -416,7 +444,7 @@ class DeepLabSegmentationService:
 
 
 class SAM2SegmentationService:
-    """Lazy-loaded service wrapper around SAM2 inference with fallback."""
+    """SAM2 inference: official checkpoint via `build_sam2`, then `checkpoints_sam2/model.torch` if present."""
 
     def __init__(self) -> None:
         self._loaded = False
@@ -443,6 +471,17 @@ class SAM2SegmentationService:
             return
 
         sam2_model = build_sam2(_to_hydra_config_name(model_cfg), str(model_ckpt), device="cpu")
+        finetuned_path = _sam2_finetuned_state_path(project_root)
+        if finetuned_path.is_file():
+            try:
+                _load_sam2_finetuned_state_dict(sam2_model, finetuned_path)
+                logger.info("SAM2 inference: loaded fine-tuned weights from %s", finetuned_path)
+            except Exception as exc:
+                logger.warning(
+                    "SAM2 inference: failed to load fine-tuned %s (%s); using pretrained weights only.",
+                    finetuned_path,
+                    exc,
+                )
         self._predictor = SAM2ImagePredictor(sam2_model)
         self._loaded = True
 
@@ -508,19 +547,24 @@ class SAM2SegmentationService:
         scores = np.concatenate(all_scores, axis=0)
         order = np.argsort(scores)[::-1][: min(len(scores), 200)]
         masks = masks[order]
+        scores = scores[order]
+
+        min_mask_score = float(os.environ.get("SAM2_MIN_MASK_SCORE", "0.3"))
 
         seg_mask = np.zeros((height, width), dtype=np.uint8)
         occupancy = np.zeros((height, width), dtype=bool)
         total_pixels = height * width
         group_area_threshold = max(200, int(total_pixels * 0.01))
-        for mask in masks:
-            if mask.sum() < 50:
+        for mask, sc in zip(masks, scores):
+            if float(sc) < min_mask_score:
+                continue
+            if int(mask.sum()) < 50:
                 continue
             overlap = np.logical_and(mask, occupancy).sum()
             if overlap > 0 and overlap / float(mask.sum()) > 0.15:
                 continue
             mask = np.logical_and(mask, np.logical_not(occupancy))
-            if mask.sum() < 50:
+            if int(mask.sum()) < 50:
                 continue
             class_id = 2 if int(mask.sum()) >= group_area_threshold else 1
             seg_mask[mask] = class_id
@@ -569,7 +613,7 @@ class UNetSegmentationService:
         project_root = Path(__file__).resolve().parents[2]
         config = DeepLabV3PlusConfig(PROJECT_DIR=project_root)
         self._img_size = int(config.IMG_SIZE)
-        self._transform = get_transform(img_size=self._img_size)
+        self._transform = get_transform(img_size=self._img_size, imagenet_norm=False)
         if smp is None:
             self._use_fallback = True
             self._fallback_reason = "U-Net dependencies unavailable; using fallback vegetation segmentation."

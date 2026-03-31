@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,11 @@ try:
     from torchvision.models.detection import maskrcnn_resnet50_fpn
 except Exception as exc:  # pragma: no cover - runtime environment dependent
     raise RuntimeError("torchvision detection module is required for Mask R-CNN training.") from exc
+
+try:
+    from backend.scripts.training_utils import EarlyStopping, apply_augmentation
+except ImportError:
+    from training_utils import EarlyStopping, apply_augmentation
 
 
 SUPPORTED_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
@@ -72,8 +78,8 @@ class TrainConfig:
     annotations_path: Path
     image_dir: Path
     save_dir: Path
-    batch_size: int = 1
-    img_size: int = 384
+    batch_size: int = 8
+    img_size: int = 1024
     max_instances_per_image: int = 80
     epochs: int = 10
     lr: float = 1e-4
@@ -81,10 +87,11 @@ class TrainConfig:
 
 
 class DetectionDataset(Dataset):
-    def __init__(self, records: list[dict], img_size: int, max_instances_per_image: int):
+    def __init__(self, records: list[dict], img_size: int, max_instances_per_image: int, training: bool = True):
         self.records = records
         self.img_size = img_size
         self.max_instances_per_image = max_instances_per_image
+        self.training = training
 
     def __len__(self) -> int:
         return len(self.records)
@@ -97,6 +104,22 @@ class DetectionDataset(Dataset):
         orig_h, orig_w = image.shape[:2]
         image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        instances = record["instances"]
+        if len(instances) > self.max_instances_per_image:
+            instances = sorted(instances, key=lambda inst: int(np.sum(inst["mask"])), reverse=True)[
+                : self.max_instances_per_image
+            ]
+
+        inst_masks_resized = [
+            cv2.resize(inst["mask"].astype(np.uint8), (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+            for inst in instances
+        ]
+        inst_labels = [int(inst["label"]) for inst in instances]
+
+        if self.training:
+            image, inst_masks_resized = apply_augmentation(image, inst_masks_resized)
+
         image_t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
         scale_x = float(self.img_size) / float(max(1, orig_w))
         scale_y = float(self.img_size) / float(max(1, orig_h))
@@ -105,16 +128,8 @@ class DetectionDataset(Dataset):
         labels = []
         boxes = []
         areas = []
-        instances = record["instances"]
-        if len(instances) > self.max_instances_per_image:
-            # Keep largest masks to limit per-sample memory pressure.
-            instances = sorted(instances, key=lambda inst: int(np.sum(inst["mask"])), reverse=True)[
-                : self.max_instances_per_image
-            ]
 
-        for instance in instances:
-            m = instance["mask"]
-            m = cv2.resize(m.astype(np.uint8), (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+        for m, label in zip(inst_masks_resized, inst_labels):
             if int(m.sum()) < 10:
                 continue
             ys, xs = np.where(m > 0)
@@ -124,7 +139,7 @@ class DetectionDataset(Dataset):
             y_max = float(ys.max())
             boxes.append([x_min, y_min, x_max, y_max])
             masks.append(m.astype(np.uint8))
-            labels.append(int(instance["label"]))
+            labels.append(label)
             areas.append(float((x_max - x_min) * (y_max - y_min) * scale_x * scale_y))
 
         if not boxes:
@@ -194,7 +209,7 @@ def _load_records(config: TrainConfig) -> tuple[list[dict], list[dict]]:
     if not train_records:
         raise RuntimeError("No training records found for Mask R-CNN.")
     if not val_records:
-        n_val = max(1, int(0.15 * len(train_records)))
+        n_val = max(1, int(0.20 * len(train_records)))
         val_records = train_records[:n_val]
         train_records = train_records[n_val:]
     return train_records, val_records
@@ -241,6 +256,86 @@ def _predict_mask(model: torch.nn.Module, image_bgr: np.ndarray, config: TrainCo
         interpolation=cv2.INTER_NEAREST,
     )
     return pred
+
+
+def _resolve_eval_image_dir(project_root: Path) -> Path:
+    candidates = [
+        project_root / "data" / "raw" / "evaluation_images",
+        project_root / "data" / "raw" / "evaluation_images_tif",
+        project_root / "data" / "raw" / "evaluation_images_png",
+    ]
+    first_existing = None
+    for path in candidates:
+        if path.exists() and path.is_dir():
+            if first_existing is None:
+                first_existing = path
+            if any(p.suffix.lower() in SUPPORTED_SUFFIXES for p in path.iterdir() if p.is_file()):
+                return path
+    return first_existing or candidates[0]
+
+
+def _compute_maskrcnn_accuracy(
+    model: torch.nn.Module, records: list[dict], config: TrainConfig, device: torch.device,
+) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    for record in records:
+        image_bgr = cv2.imread(str(record["image_path"]))
+        if image_bgr is None:
+            continue
+        gt_mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+        for inst in record["instances"]:
+            gt_mask[inst["mask"] > 0] = int(inst["label"])
+        pred_mask = _predict_mask(model, image_bgr, config, device)
+        correct += int(np.sum(pred_mask == gt_mask))
+        total += int(gt_mask.size)
+    return round(float(correct) / max(1, total), 6)
+
+
+def _compute_test_accuracy_maskrcnn(
+    model: torch.nn.Module, config: TrainConfig, device: torch.device,
+) -> float | None:
+    eval_annot = config.project_root / "data" / "raw" / "annotations" / "evaluation_annotations.json"
+    if not eval_annot.exists():
+        return None
+    try:
+        payload = json.loads(eval_annot.read_text(encoding="utf-8"))
+        eval_image_dir = _resolve_eval_image_dir(config.project_root)
+        records: list[dict] = []
+        for img_info in payload.get("images", []):
+            stem = Path(img_info.get("file_name", "")).stem
+            if not stem:
+                continue
+            img_path = None
+            for suffix in SUPPORTED_SUFFIXES:
+                candidate = eval_image_dir / f"{stem}{suffix}"
+                if candidate.exists():
+                    img_path = candidate
+                    break
+            if img_path is None:
+                continue
+            w, h = int(img_info.get("width", 0)), int(img_info.get("height", 0))
+            if w <= 0 or h <= 0:
+                continue
+            instances = []
+            for ann in img_info.get("annotations", []):
+                cls_name = ann.get("class")
+                label = 1 if cls_name == "individual_tree" else 2 if cls_name == "group_of_trees" else None
+                if label is None:
+                    continue
+                mask = _polygon_binary_mask(w, h, ann.get("segmentation", []))
+                if int(mask.sum()) == 0:
+                    continue
+                instances.append({"mask": mask, "label": label})
+            if not instances:
+                continue
+            records.append({"image_path": img_path, "instances": instances})
+        if not records:
+            return None
+        return _compute_maskrcnn_accuracy(model, records, config, device)
+    except Exception:
+        return None
 
 
 def _save_evaluation_artifacts(
@@ -357,7 +452,7 @@ def train(config: TrainConfig) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
     config.save_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device("GPU" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_records, val_records = _load_records(config)
     print(
         f"[Mask R-CNN] device={device} train={len(train_records)} val={len(val_records)} epochs={config.epochs} "
@@ -365,15 +460,16 @@ def train(config: TrainConfig) -> None:
         flush=True,
     )
     loader = DataLoader(
-        DetectionDataset(train_records, config.img_size, config.max_instances_per_image),
+        DetectionDataset(train_records, config.img_size, config.max_instances_per_image, training=True),
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.workers,
         collate_fn=_collate_fn,
     )
 
-    model = maskrcnn_resnet50_fpn(weights=None, weights_backbone=None, num_classes=3).to(device)
+    model = maskrcnn_resnet50_fpn(weights=None, weights_backbone="DEFAULT", num_classes=3).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
+    early_stopping = EarlyStopping(patience=10)
 
     best_loss = float("inf")
     try:
@@ -407,6 +503,9 @@ def train(config: TrainConfig) -> None:
                     config.save_dir / "best_model.pth",
                 )
                 print(f"[Mask R-CNN] saved best checkpoint: {config.save_dir / 'best_model.pth'}", flush=True)
+            if early_stopping.should_stop(-mean_loss):
+                print(f"[Mask R-CNN] early stopping at epoch {epoch+1}", flush=True)
+                break
     except Exception as exc:
         print(f"[Mask R-CNN][ERROR] {exc}", flush=True)
         print(traceback.format_exc(), flush=True)
@@ -414,6 +513,31 @@ def train(config: TrainConfig) -> None:
 
     torch.save({"model_state_dict": model.state_dict()}, config.save_dir / "final_model.pth")
     print(f"[Mask R-CNN] complete. Best loss={best_loss:.4f}. Saved to {config.save_dir}", flush=True)
+
+    print("[Mask R-CNN] Computing training results...", flush=True)
+    train_acc = _compute_maskrcnn_accuracy(model, train_records, config, device)
+    val_acc = _compute_maskrcnn_accuracy(model, val_records, config, device)
+    test_acc = _compute_test_accuracy_maskrcnn(model, config, device)
+    eval_root = config.project_root / "output" / "evaluation" / "maskrcnn"
+    eval_root.mkdir(parents=True, exist_ok=True)
+    training_results = {
+        "method": "maskrcnn",
+        "train_accuracy": train_acc,
+        "val_accuracy": val_acc,
+        "test_accuracy": test_acc,
+        "best_train_loss": round(best_loss, 6),
+        "epochs": config.epochs,
+        "timestamp": int(time.time()),
+    }
+    (eval_root / "training_results.json").write_text(
+        json.dumps(training_results, indent=2), encoding="utf-8",
+    )
+    print(
+        f"[Mask R-CNN] Results: train_acc={train_acc:.4f} val_acc={val_acc:.4f}"
+        f" test_acc={test_acc if test_acc is not None else 'N/A'}",
+        flush=True,
+    )
+
     _save_evaluation_artifacts(model, val_records, config, device)
 
 
@@ -421,8 +545,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Mask R-CNN training workflow")
     parser.add_argument("action", choices=["train"], default="train")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--img-size", type=int, default=384)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--img-size", type=int, default=1024)
     parser.add_argument("--max-instances-per-image", type=int, default=80)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--workers", type=int, default=0)

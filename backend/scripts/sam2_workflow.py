@@ -1,5 +1,10 @@
 """
-Train/Fine-Tune SAM 2 on a custom dataset using polygon annotations.  # Module-level docstring describing purpose
+Train/Fine-Tune SAM 2 on a custom dataset using polygon annotations.
+
+Reference note: batch_grounded_sam.py uses Hugging Face SAM ViT-Base + GroundingDINO (zero-shot),
+not Meta SAM2. This workflow keeps the sam2 package + Hiera checkpoints; we align analogous
+settings where sensible (e.g. SAM2_MIN_MASK_SCORE=0.3 like that script's detection threshold).
+
 This script adapts TRAIN_multi_image_batch.py to a folder layout like:  # Context of adaptation
 - Images:        ./data/raw/train_images_tif/* or ./data/raw/train_images_png/* or ./train_images/*  # Expected image directory
 - Annotations:   ./data/raw/annotations/train_annotations.json or ./train_annotations.json  # Expected annotation file
@@ -171,8 +176,8 @@ MODEL_CFG = _resolve_file_path([
     ),
 ])  # Model configuration yaml
 
-BATCH_SIZE = int(os.getenv("SAM2_BATCH_SIZE", "4"))  # Images per mini-batch
-LR = float(os.getenv("SAM2_LR", "1e-5"))  # Learning rate for AdamW
+BATCH_SIZE = int(os.getenv("SAM2_BATCH_SIZE", "6"))  # Match Colab batch micro-size; HF Grounded-SAM script uses per-image calls
+LR = float(os.getenv("SAM2_LR", "1e-4"))  # Learning rate for AdamW
 WEIGHT_DECAY = 4e-5  # L2 weight decay strength
 STEPS = int(os.getenv("SAM2_STEPS", "3000"))  # Total optimization steps (balanced default)
 SAVE_EVERY = int(os.getenv("SAM2_SAVE_EVERY", "200"))  # Save model every N steps
@@ -183,7 +188,7 @@ PAD_SIZE = 1024  # Then pad canvas to this size (square)
 TRAIN_IMAGE_ENCODER = False  # If True, also train image encoder (see notes above)
 
 RANDOM_SEED = 42  # Seed for reproducibility
-TRAIN_RATIO = 0.85  # Train split proportion
+TRAIN_RATIO = 0.80  # Train split proportion (80/20)
 
 EVAL_OUT_DIR = os.path.join(PROJECT_DIR, "output", "evaluation", "sam2")  # SAM2-scoped eval output root
 EVAL_OVERLAYS_DIR = os.path.join(EVAL_OUT_DIR, "overlays")  # Color overlays path
@@ -197,6 +202,8 @@ EVAL_TOPK = 200  # Keep top-K masks by score before NMS-like filtering
 EVAL_MIN_PIXELS = 50  # Discard tiny masks
 EVAL_OVERLAP_FRAC = 0.15  # Reject prediction if >15% overlaps existing occupancy
 EVAL_IOU_THRESH = 0.75  # IoU threshold for TP in AP@0.75
+# Mask confidence floor (batch_grounded_sam.py uses threshold=0.3 for detections → analogous SAM mask scores)
+MIN_MASK_SCORE = float(os.getenv("SAM2_MIN_MASK_SCORE", "0.3"))
 
 CURVES_OUT_DIR = os.path.join(PROJECT_DIR, "output", "curves")  # Folder for training curves
 MODEL_STATE_PATH = os.path.join(SAM2_CHECKPOINT_DIR, "model.torch")
@@ -511,6 +518,8 @@ def evaluate_on_validation(val_entries: List[Dict[str, Any]], predictor: SAM2Ima
         kept_scores: List[float] = []  # Scores for kept instances
         kept_count = 0  # Instance counter
         for m, sc in zip(masks, scores):  # Iterate candidate masks
+            if float(sc) < MIN_MASK_SCORE:  # Align with Grounded-SAM-style detection threshold (0.3)
+                continue
             if m.sum() < EVAL_MIN_PIXELS:  # Drop tiny masks
                 continue  # Skip
             overlap = (m & occupancy).sum()  # Overlap pixel count
@@ -860,6 +869,30 @@ def main():
         evaluate_on_validation(val_entries, predictor, device=device)  # Run evaluation
     except Exception as e:
         print("[WARN] Validation evaluation failed:", e)  # Non-fatal warning
+
+    import time as _time
+    final_train_iou = train_iou_hist[-1] if train_iou_hist else None
+    final_val_iou = val_iou_hist[-1] if val_iou_hist else None
+    if final_val_iou is not None and (final_val_iou != final_val_iou):
+        final_val_iou = None
+    training_results = {
+        "method": "sam2",
+        "train_accuracy": round(final_train_iou, 6) if final_train_iou is not None else None,
+        "val_accuracy": round(final_val_iou, 6) if final_val_iou is not None else None,
+        "test_accuracy": None,
+        "metric_type": "iou",
+        "steps": STEPS,
+        "timestamp": int(_time.time()),
+    }
+    _ensure_dir(EVAL_OUT_DIR)
+    results_path = os.path.join(EVAL_OUT_DIR, "training_results.json")
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(training_results, f, indent=2)
+    print(
+        f"[SAM2] Results: train_iou={final_train_iou:.4f if final_train_iou else 'N/A'}"
+        f" val_iou={final_val_iou:.4f if final_val_iou else 'N/A'}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":  # Standard Python entrypoint check
