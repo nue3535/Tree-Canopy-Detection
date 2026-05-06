@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 import torch
@@ -37,6 +39,25 @@ class FocalLoss(nn.Module):
         ce = F.cross_entropy(logits, targets, reduction="none")
         pt = torch.exp(-ce)
         return (self.alpha * (1 - pt) ** self.gamma * ce).mean()
+
+
+class DiceCELoss(nn.Module):
+    """Cross-entropy + soft Dice term (tree_canopy_multimodel_training_evaluation_fixed.ipynb)."""
+
+    def __init__(self, num_classes: int = 3) -> None:
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss()
+        self.num_classes = num_classes
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = self.ce(logits, targets)
+        probs = F.softmax(logits, dim=1)
+        one_hot = F.one_hot(targets, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+        dims = (0, 2, 3)
+        inter = torch.sum(probs * one_hot, dims)
+        denom = torch.sum(probs + one_hot, dims)
+        dice = (2 * inter + 1e-6) / (denom + 1e-6)
+        return ce_loss + (1 - dice.mean())
 
 
 class DiceFocalSegLoss(nn.Module):
@@ -175,6 +196,48 @@ def make_deeplab_notebook_train_transform(img_size: int):
     )
 
 
+def make_multimodel_nb_train_transform(img_size: int):
+    """Albumentations train pipeline from tree_canopy_multimodel_training_evaluation_fixed.ipynb.
+
+    Matches that notebook's ``train_tfms``: Resize, H/V flip, RandomRotate90, RandomBrightnessContrast(p=0.3),
+    then normalize (notebook uses ``A.Normalize()`` with ImageNet defaults; we set mean/std explicitly).
+    """
+    try:
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("albumentations is required for multimodel notebook-style training.") from exc
+
+    return A.Compose(
+        [
+            A.Resize(img_size, img_size),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            A.RandomBrightnessContrast(p=0.3),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2(),
+        ]
+    )
+
+
+def make_multimodel_nb_val_transform(img_size: int):
+    """Albumentations eval pipeline from multimodel Colab notebook."""
+    try:
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("albumentations is required for multimodel notebook-style validation.") from exc
+
+    return A.Compose(
+        [
+            A.Resize(img_size, img_size),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2(),
+        ]
+    )
+
+
 def make_deeplab_notebook_val_transform(img_size: int):
     """Validation: resize + ImageNet normalize + tensor (notebook val pipeline)."""
     try:
@@ -195,19 +258,45 @@ def make_deeplab_notebook_val_transform(img_size: int):
 # --------------- Early Stopping ---------------
 
 class EarlyStopping:
-    """Stop training when a monitored metric stops improving."""
+    """Stop training when a monitored metric stops improving (higher-is-better or lower-is-better)."""
 
-    def __init__(self, patience: int = 10, min_delta: float = 0.001) -> None:
+    def __init__(self, patience: int = 10, min_delta: float = 0.001, mode: str = "max") -> None:
+        if mode not in ("max", "min"):
+            raise ValueError("EarlyStopping mode must be 'max' or 'min'")
         self.patience = patience
         self.min_delta = min_delta
+        self.mode = mode
         self.counter = 0
         self.best_score: float | None = None
 
+    def step(self, score: float) -> tuple[bool, bool]:
+        """Update with one validation score. Returns (improved, should_stop).
+
+        NaN scores are ignored: no improvement, patience unchanged, do not stop.
+        Accepts Python ``float`` or NumPy scalar (e.g. validation metrics from NumPy).
+        """
+        try:
+            s = float(score)
+        except (TypeError, ValueError):
+            return False, False
+        if math.isnan(s):
+            return False, False
+        if self.best_score is None:
+            self.best_score = s
+            self.counter = 0
+            return True, False
+        if self.mode == "max":
+            improved = s > self.best_score + self.min_delta
+        else:
+            improved = s < self.best_score - self.min_delta
+        if improved:
+            self.best_score = s
+            self.counter = 0
+            return True, False
+        self.counter += 1
+        return False, self.counter >= self.patience
+
     def should_stop(self, score: float) -> bool:
         """Return True when no improvement for *patience* evaluations."""
-        if self.best_score is None or score > self.best_score + self.min_delta:
-            self.best_score = score
-            self.counter = 0
-            return False
-        self.counter += 1
-        return self.counter >= self.patience
+        _, stop = self.step(score)
+        return stop

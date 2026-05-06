@@ -8,6 +8,13 @@ from typing import Any
 import cv2
 import numpy as np
 
+from backend.app.data_layout import (
+    resolve_evaluation_annotations_path,
+    resolve_evaluation_image_dir,
+    resolve_train_annotations_path,
+    resolve_train_image_dir,
+)
+
 CLASS_IDS = [0, 1, 2]
 
 
@@ -15,39 +22,6 @@ def _safe_div(numerator: float, denominator: float) -> float:
     if denominator == 0:
         return 0.0
     return float(numerator) / float(denominator)
-
-
-def _resolve_image_dir(project_root: Path, split: str) -> Path:
-    if split == "train":
-        candidates = [
-            project_root / "data" / "raw" / "train_images",
-            project_root / "data" / "raw" / "train_images_tif",
-            project_root / "data" / "raw" / "train_images_png",
-        ]
-    else:
-        candidates = [
-            project_root / "data" / "raw" / "evaluation_images",
-            project_root / "data" / "raw" / "evaluation_images_tif",
-            project_root / "data" / "raw" / "evaluation_images_png",
-        ]
-
-    first_existing = None
-    for path in candidates:
-        if path.exists() and path.is_dir():
-            if first_existing is None:
-                first_existing = path
-            count = len(
-                [
-                    p
-                    for p in path.iterdir()
-                    if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-                ]
-            )
-            if count > 0:
-                return path
-    if first_existing is not None:
-        return first_existing
-    return candidates[0]
 
 
 def _list_images(directory: Path) -> list[Path]:
@@ -269,12 +243,12 @@ class EvaluationService:
         if not force and self._cache and (now - self._cache_ts) < self._cache_ttl_seconds:
             return self._cache
 
-        train_dir = _resolve_image_dir(self.project_root, "train")
-        eval_dir = _resolve_image_dir(self.project_root, "evaluation")
+        train_dir = resolve_train_image_dir(self.project_root)
+        eval_dir = resolve_evaluation_image_dir(self.project_root)
         train_images = _list_images(train_dir)
         eval_images = _list_images(eval_dir)
-        train_gt_path = self.project_root / "data" / "raw" / "annotations" / "train_annotations.json"
-        eval_gt_path = self.project_root / "data" / "raw" / "annotations" / "evaluation_annotations.json"
+        train_gt_path = resolve_train_annotations_path(self.project_root)
+        eval_gt_path = resolve_evaluation_annotations_path(self.project_root)
         train_gt_map = _build_gt_map_from_annotations(train_gt_path)
         eval_gt_map = _build_gt_map_from_annotations(eval_gt_path)
 

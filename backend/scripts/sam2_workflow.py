@@ -2,47 +2,42 @@
 Train/Fine-Tune SAM 2 on a custom dataset using polygon annotations.
 
 Reference note: batch_grounded_sam.py uses Hugging Face SAM ViT-Base + GroundingDINO (zero-shot),
-not Meta SAM2. This workflow keeps the sam2 package + Hiera checkpoints; we align analogous
-settings where sensible (e.g. SAM2_MIN_MASK_SCORE=0.3 like that script's detection threshold).
+not Meta SAM2. Fine-tuning loads a **base** Meta ``.pt`` (see ``SAM2_BASE_CHECKPOINT``) plus a Hiera YAML,
+trains the prompt encoder + mask decoder with **GT box** prompts, and exports student weights to
+``checkpoints_sam2/sam2_finetuned_tree_canopy.pt``. Grid-point validation (AP-style) remains available via ``SAM2_GRID_EVAL=1``.
 
 This script adapts TRAIN_multi_image_batch.py to a folder layout like:  # Context of adaptation
-- Images:        ./data/raw/train_images_tif/* or ./data/raw/train_images_png/* or ./train_images/*  # Expected image directory
-- Annotations:   ./data/raw/annotations/train_annotations.json or ./train_annotations.json  # Expected annotation file
+- Images:        ./data/train_images/*.tif (primary) or ./data/raw/train_images_*/* or ./train_images/*  # Expected image directory
+- Annotations:   ./data/train_annotations_updated_*.json (preferred), ./data/train_annotations.json, or legacy ./data/raw/annotations/...
 - Optional masks: ./viz_masks, ./masks (not used for training here)  # Optional extras (not used)
 
-We parse polygons for two classes: "individual_tree" and "group_of_trees",  # Target classes
-convert them to binary masks on-the-fly, and train with multi-image batches.  # On-the-fly rasterization + batching
+We parse polygons for two classes: "individual_tree" and "group_of_trees", rasterize instance masks,
+and fine-tune with box prompts at ``SAM2_PROMPT_IMAGE_SIZE`` (default 512).
 
 Notes:
-- By default we train the prompt encoder + mask decoder. If you also want to train  # Training scope
-  the image encoder, set TRAIN_IMAGE_ENCODER=True; however, upstream SAM2 code  # Caveat about upstream
-  includes some no_grad paths — you may need to remove them to allow gradients.  # Warning on gradients
-- We resize images so the long side <= 1024, then pad to 1024x1024 to have  # Preprocessing strategy
-  consistent shapes in a batch (matching the example script’s approach).  # Reason for padding
+- Default: freeze the image encoder (``SAM2_FREEZE_IMAGE_ENCODER``); set to ``0`` to unfreeze.
+- Epochs / LR / WD: ``SAM2_TRAIN_EPOCHS``, ``SAM2_TRAIN_LR``, ``SAM2_TRAIN_WEIGHT_DECAY``.
+- Early stopping on validation loss: ``SAM2_EARLY_STOPPING_PATIENCE`` (default 25; ``0`` disables),
+  ``SAM2_EARLY_STOPPING_MIN_DELTA``. Best ``val_loss`` weights are restored before saving the student checkpoint.
+- Training log cadence: each epoch prints start lines for train/val; every ``SAM2_TRAIN_LOG_EVERY`` images (default 10)
+  prints progress within an epoch; set ``SAM2_TRAIN_LOG_EVERY=0`` to disable mid-epoch lines only.
+- Epoch checkpoints: ``checkpoints_sam2/sam2_training_latest.pt`` (full resume state after each epoch) and
+  ``sam2_training_best.pt`` (best val_loss weights). Set ``SAM2_RESUME=1`` to continue from ``latest`` (skips warm-start
+  from the inference export if ``latest`` exists).
 
 Usage:
   python backend/scripts/sam2_workflow.py  # How to run
 
 Requirements:
-  - torch, numpy, opencv-python, tqdm, matplotlib  # Python dependencies
-  - segment-anything-2 codebase/environment for `sam2` imports  # External SAM2 dependency
-  - SAM2 checkpoint and config files (see constants below)  # Model assets
+  - torch, numpy, opencv-python, tqdm, matplotlib
+  - ``sam2`` (Segment Anything 2) with a matching Hiera YAML
+  - Base checkpoint ``.pt`` on disk (``SAM2_CHECKPOINT`` / ``checkpoints_sam2/*.pt``)
 
-Workflow overview:  # High-level pipeline
-  1) Load annotations and image paths, assemble train/val splits.  # Step 1
-     - If `data/processed/train.txt` and `data/processed/val.txt` exist, use them.  # Preferred fixed split
-  2) For each training step, sample a mini-batch:  # Step 2
-     - Read images, resize/pad to fixed size.  # 2a
-     - Select one instance polygon per image, rasterize to a binary mask.  # 2b
-     - Sample one positive point prompt inside the mask.  # 2c
-  3) Forward pass through SAM2 (prompt encoder + mask decoder). Compute:  # Step 3
-     - Sigmoid BCE segmentation loss between predicted and GT mask.  # Loss 1
-     - Score alignment loss to align predicted confidence with IoU.  # Loss 2
-  4) Optimize, periodically save weights and log/plot IoU curves.  # Step 4
-  5) After training, run a grid-point prompt sweep on the validation set:  # Step 5
-     - Collect top-K unique, non-overlapping predictions.  # Postproc
-     - Save color overlays & instance masks.  # Outputs
-     - Compute AP@0.75 per class and IoU histograms (matched vs unmatched).  # Metrics
+Workflow overview:
+  1) Load annotations; use ``train.txt`` / ``val.txt`` / optional ``test.txt`` when present.
+  2) Fine-tune with GT boxes (BCE+Dice + score loss) for ``SAM2_TRAIN_EPOCHS`` epochs.
+  3) Save ``checkpoints_sam2/sam2_finetuned_tree_canopy.pt`` (dict with ``finetuned_state_dict``).
+  4) Evaluate with the same box prompts (semantic 3-class IoU); optional grid-point AP eval if ``SAM2_GRID_EVAL=1``.
 """
 
 import os  # OS utilities (paths, env vars, directories)
@@ -51,12 +46,17 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")  # Limit OpenMP threads to reduce 
 
 from contextlib import nullcontext
 import json  # JSON parsing for annotations
+import math  # isnan for training_results serialization
+import time  # Per-epoch duration logging
 from pathlib import Path
 import random  # Deterministic splitting and sampling
 from typing import List, Tuple, Dict, Any  # Type hints for clarity
 
+from collections import defaultdict  # Per-class metric lists in prompted eval
+
 import numpy as np  # Numerical arrays and mask operations
 import torch  # Tensors, autograd, CUDA, optimizers, AMP
+import torch.nn.functional as F  # BCE-with-logits and losses for SAM2 fine-tune
 import cv2  # Image I/O and geometry (OpenCV)
 
 try:
@@ -73,6 +73,17 @@ try:
 except Exception:
     def tqdm(x, **kwargs):  # Fallback no-op progress if tqdm missing
         return x  # Return iterable unchanged
+
+try:
+    from backend.app.data_layout import resolve_train_annotations_path, resolve_train_image_dir
+except ImportError:
+    resolve_train_image_dir = None  # type: ignore[misc, assignment]
+    resolve_train_annotations_path = None  # type: ignore[misc, assignment]
+
+try:
+    from backend.scripts.training_utils import EarlyStopping
+except ImportError:
+    from training_utils import EarlyStopping
 
 
 # ----------------------- Config -----------------------
@@ -133,33 +144,40 @@ def _to_hydra_config_name(config_path: str) -> str:
     return os.path.basename(norm)
 
 
-IMAGES_DIR = _resolve_image_dir(
-    os.path.join(PROJECT_DIR, "data", "raw", "train_images_tif"),
-    os.path.join(PROJECT_DIR, "data", "raw", "train_images_png"),
-    os.path.join(PROJECT_DIR, "train_images"),
-)  # Directory containing training images
-ANNOT_JSON = _resolve_first_path(
-    os.path.join(PROJECT_DIR, "data", "raw", "annotations", "train_annotations.json"),
-    os.path.join(PROJECT_DIR, "train_annotations.json"),
-)  # Path to annotation JSON
+if resolve_train_image_dir is not None:
+    IMAGES_DIR = str(resolve_train_image_dir(Path(PROJECT_DIR)))
+    ANNOT_JSON = str(resolve_train_annotations_path(Path(PROJECT_DIR)))
+else:
+    IMAGES_DIR = _resolve_image_dir(
+        os.path.join(PROJECT_DIR, "data", "train_images"),
+        os.path.join(PROJECT_DIR, "data", "raw", "train_images_tif"),
+        os.path.join(PROJECT_DIR, "data", "raw", "train_images_png"),
+        os.path.join(PROJECT_DIR, "train_images"),
+    )
+    ANNOT_JSON = _resolve_first_path(
+        os.path.join(PROJECT_DIR, "data", "train_annotations_updated_504bcc9e05b54435a9a56a841a3a1cf5.json"),
+        os.path.join(PROJECT_DIR, "data", "train_annotations.json"),
+        os.path.join(PROJECT_DIR, "data", "raw", "annotations", "train_annotations.json"),
+        os.path.join(PROJECT_DIR, "train_annotations.json"),
+    )
 TRAIN_SPLIT_TXT = os.path.join(PROJECT_DIR, "data", "processed", "train.txt")
 VAL_SPLIT_TXT = os.path.join(PROJECT_DIR, "data", "processed", "val.txt")
+TEST_SPLIT_TXT = os.path.join(PROJECT_DIR, "data", "processed", "test.txt")
 
 ALLOWED_CLASSES = {"individual_tree", "group_of_trees"}  # Classes to include
 
 SAM2_CHECKPOINT_DIR = os.path.join(PROJECT_DIR, "checkpoints_sam2")
 os.makedirs(SAM2_CHECKPOINT_DIR, exist_ok=True)
 
-SAM2_CHECKPOINT = _resolve_file_path([
-    os.getenv("SAM2_CHECKPOINT", "").strip(),
-    os.path.join(SAM2_CHECKPOINT_DIR, "sam2_hiera_small.pt"),
-    os.path.join(PROJECT_DIR, "sam2_hiera_small.pt"),
-    os.path.join(PROJECT_DIR, "checkpoints", "sam2_hiera_small.pt"),
-    os.path.join(PROJECT_DIR, "backend", "checkpoints", "sam2_hiera_small.pt"),
-])  # Pretrained checkpoint file
+# Student checkpoint path (same file the API loads). No Meta/public pretrained .pt is used.
+SAM2_STUDENT_EXPORT = os.path.join(SAM2_CHECKPOINT_DIR, "sam2_finetuned_tree_canopy.pt")
 MODEL_CFG = _resolve_file_path([
     os.getenv("SAM2_MODEL_CFG", "").strip(),
     os.getenv("MODEL_CFG", "").strip(),
+    os.path.join(SAM2_CHECKPOINT_DIR, "sam2_hiera_l.yaml"),
+    os.path.join(PROJECT_DIR, "sam2_hiera_l.yaml"),
+    os.path.join(PROJECT_DIR, "configs", "sam2_hiera_l.yaml"),
+    os.path.join(PROJECT_DIR, "backend", "configs", "sam2_hiera_l.yaml"),
     os.path.join(SAM2_CHECKPOINT_DIR, "sam2_hiera_s.yaml"),
     os.path.join(PROJECT_DIR, "sam2_hiera_s.yaml"),
     os.path.join(PROJECT_DIR, "configs", "sam2_hiera_s.yaml"),
@@ -176,9 +194,9 @@ MODEL_CFG = _resolve_file_path([
     ),
 ])  # Model configuration yaml
 
-BATCH_SIZE = int(os.getenv("SAM2_BATCH_SIZE", "6"))  # Match Colab batch micro-size; HF Grounded-SAM script uses per-image calls
+BATCH_SIZE = int(os.getenv("SAM2_BATCH_SIZE", "2"))  # Multimodel notebook-style micro-batch
 LR = float(os.getenv("SAM2_LR", "1e-4"))  # Learning rate for AdamW
-WEIGHT_DECAY = 4e-5  # L2 weight decay strength
+WEIGHT_DECAY = float(os.getenv("SAM2_WEIGHT_DECAY", "1e-4"))  # Match multimodel AdamW wd
 STEPS = int(os.getenv("SAM2_STEPS", "3000"))  # Total optimization steps (balanced default)
 SAVE_EVERY = int(os.getenv("SAM2_SAVE_EVERY", "200"))  # Save model every N steps
 
@@ -188,7 +206,7 @@ PAD_SIZE = 1024  # Then pad canvas to this size (square)
 TRAIN_IMAGE_ENCODER = False  # If True, also train image encoder (see notes above)
 
 RANDOM_SEED = 42  # Seed for reproducibility
-TRAIN_RATIO = 0.80  # Train split proportion (80/20)
+TRAIN_RATIO = float(os.getenv("SAM2_TRAIN_RATIO", "0.7"))  # Multimodel notebook ~70% train when no fixed splits
 
 EVAL_OUT_DIR = os.path.join(PROJECT_DIR, "output", "evaluation", "sam2")  # SAM2-scoped eval output root
 EVAL_OVERLAYS_DIR = os.path.join(EVAL_OUT_DIR, "overlays")  # Color overlays path
@@ -206,7 +224,46 @@ EVAL_IOU_THRESH = 0.75  # IoU threshold for TP in AP@0.75
 MIN_MASK_SCORE = float(os.getenv("SAM2_MIN_MASK_SCORE", "0.3"))
 
 CURVES_OUT_DIR = os.path.join(PROJECT_DIR, "output", "curves")  # Folder for training curves
-MODEL_STATE_PATH = os.path.join(SAM2_CHECKPOINT_DIR, "model.torch")
+# Resume / periodic saves: primary export for inference; legacy `model.torch` still resumed if present.
+MODEL_STATE_PATH = SAM2_STUDENT_EXPORT
+MODEL_STATE_LEGACY = os.path.join(SAM2_CHECKPOINT_DIR, "model.torch")
+# Mid-run epoch checkpoints (optimizer + scaler + history). Resume with SAM2_RESUME=1.
+SAM2_TRAINING_LATEST = os.path.join(SAM2_CHECKPOINT_DIR, "sam2_training_latest.pt")
+SAM2_TRAINING_BEST = os.path.join(SAM2_CHECKPOINT_DIR, "sam2_training_best.pt")
+SAM2_TRAINING_CKPT_KIND = "sam2_epoch_training_v1"
+SAM2_TRAINING_BEST_KIND = "sam2_training_best_v1"
+SAM2_RESUME_TRAINING = os.getenv("SAM2_RESUME", "").strip().lower() in ("1", "true", "yes")
+
+# Fine-tuning + box-prompted evaluation (semantic IoU on 3-class mask)
+SAM2_TRAIN_EPOCHS = int(os.getenv("SAM2_TRAIN_EPOCHS", "500"))
+SAM2_TRAIN_LR = float(os.getenv("SAM2_TRAIN_LR", "1e-5"))
+SAM2_TRAIN_WEIGHT_DECAY = float(os.getenv("SAM2_TRAIN_WEIGHT_DECAY", "4e-5"))
+SAM2_MAX_INSTANCES_PER_IMAGE = int(os.getenv("SAM2_MAX_INSTANCES_PER_IMAGE", "8"))
+SAM2_FREEZE_IMAGE_ENCODER = os.getenv("SAM2_FREEZE_IMAGE_ENCODER", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+SAM2_PROMPT_IMAGE_SIZE = int(os.getenv("SAM2_PROMPT_IMAGE_SIZE", "512"))
+SAM2_FINETUNED_WEIGHTS = SAM2_STUDENT_EXPORT
+SAM2_EARLY_STOPPING_PATIENCE = int(os.getenv("SAM2_EARLY_STOPPING_PATIENCE", "25"))
+SAM2_EARLY_STOPPING_MIN_DELTA = float(os.getenv("SAM2_EARLY_STOPPING_MIN_DELTA", "1e-4"))
+# Within-epoch image progress (0 disables mid-epoch lines; epoch start/end always logged).
+SAM2_TRAIN_LOG_EVERY = int(os.getenv("SAM2_TRAIN_LOG_EVERY", "10"))
+# Meta / public base weights path (required to initialize Hiera before student fine-tuning).
+SAM2_BASE_CHECKPOINT = _resolve_file_path(
+    [
+        os.getenv("SAM2_CHECKPOINT", "").strip(),
+        os.getenv("SAM2_BASE_CHECKPOINT", "").strip(),
+        os.path.join(SAM2_CHECKPOINT_DIR, "sam2_hiera_large.pt"),
+        os.path.join(SAM2_CHECKPOINT_DIR, "sam2_hiera_l.pt"),
+        os.path.join(SAM2_CHECKPOINT_DIR, "sam2_hiera_base_plus.pt"),
+    ]
+)
+SAM2_GRID_EVAL = os.getenv("SAM2_GRID_EVAL", "0").strip().lower() in ("1", "true", "yes")
+
+NUM_SAM2_CLASSES = 3
+ID_TO_CLASS_SAM2 = {0: "background", 1: "individual_tree", 2: "group_of_trees"}
 
 
 # -------------------- Data Loading --------------------
@@ -287,9 +344,10 @@ def build_dataset(
     annot_json: str,
     train_split_txt: str | None = None,
     val_split_txt: str | None = None,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    test_split_txt: str | None = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Construct train/val lists of entries from COCO-like JSON.  # Docstring
+    Construct train/val/(optional test) entry lists from COCO-like JSON.  # Docstring
     Each entry has: image_path, orig_size (H,W), stem, instances[{poly, class}].  # Structure
     """
     data = _read_json(annot_json)  # Load annotations JSON
@@ -326,17 +384,22 @@ def build_dataset(
             "instances": instances,  # Instances list
         })
 
+    test_entries: List[Dict[str, Any]] = []
+    test_path = test_split_txt or TEST_SPLIT_TXT
     if train_split_txt and val_split_txt and os.path.exists(train_split_txt) and os.path.exists(val_split_txt):
         train_stems = set(_read_split_file(train_split_txt))
         val_stems = set(_read_split_file(val_split_txt))
         train_entries = [entry for entry in entries if entry["stem"] in train_stems]
         val_entries = [entry for entry in entries if entry["stem"] in val_stems]
+        if os.path.exists(test_path):
+            test_stems = set(_read_split_file(test_path))
+            test_entries = [entry for entry in entries if entry["stem"] in test_stems]
     else:
         random.Random(RANDOM_SEED).shuffle(entries)  # Deterministic shuffle
         n_train = max(1, int(len(entries) * TRAIN_RATIO))  # Compute train count
         train_entries = entries[:n_train]  # Slice train split
         val_entries = entries[n_train:]  # Slice val split
-    return train_entries, val_entries  # Return splits
+    return train_entries, val_entries, test_entries  # Return splits
 
 
 def read_single(entry: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, List[List[int]]]:
@@ -381,6 +444,585 @@ def read_batch(entries: List[Dict[str, Any]], batch_size: int = BATCH_SIZE):
         lmask.append(mask)  # Accumulate mask
         linput_point.append(input_point)  # Accumulate point
     return limage, np.array(lmask), np.array(linput_point), np.ones([batch_size, 1], dtype=np.int32)  # Labels=1
+
+
+# -------------------- SAM2 fine-tuning + box-prompted semantic eval --------------------
+def _class_name_to_id(name: str) -> int:
+    if name == "individual_tree":
+        return 1
+    if name == "group_of_trees":
+        return 2
+    return 0
+
+
+def _safe_nanmean(values: List[float]) -> float:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return float("nan")
+    return float(np.nanmean(arr))
+
+
+def _metric_dict_for_json(d: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(v, (float, np.floating)) and (math.isnan(float(v)) or math.isinf(float(v))):
+            out[k] = None
+        elif isinstance(v, (float, np.floating)):
+            out[k] = round(float(v), 6)
+        else:
+            out[k] = v
+    return out
+
+
+def _optional_round_mean_iou(m: Dict[str, Any]) -> float | None:
+    x = m.get("mean_iou", float("nan"))
+    if isinstance(x, (float, np.floating)) and (math.isnan(float(x)) or math.isinf(float(x))):
+        return None
+    return round(float(x), 6)
+
+
+def _compute_pixel_accuracy_semantic(pred: np.ndarray, gt: np.ndarray) -> float:
+    return float(np.mean(pred == gt))
+
+
+def _compute_iou_per_class_semantic(pred: np.ndarray, gt: np.ndarray, num_classes: int) -> Dict[int, float]:
+    out: Dict[int, float] = {}
+    for c in range(num_classes):
+        p = pred == c
+        g = gt == c
+        inter = int(np.logical_and(p, g).sum())
+        union = int(np.logical_or(p, g).sum())
+        out[c] = float(inter) / float(union + 1e-6)
+    return out
+
+
+def _empty_prompted_metrics() -> Dict[str, Any]:
+    m: Dict[str, Any] = {"pixel_accuracy": float("nan"), "mean_iou": float("nan")}
+    for cid in range(NUM_SAM2_CLASSES):
+        m[f"iou_{ID_TO_CLASS_SAM2[cid]}"] = float("nan")
+    return m
+
+
+def _read_rgb_for_prompt(image_path: str) -> np.ndarray:
+    bgr = cv2.imread(image_path)
+    if bgr is None:
+        raise FileNotFoundError(image_path)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def annotations_to_instance_targets_from_entry(entry: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    H0, W0 = entry["orig_size"]
+    boxes_list: List[List[float]] = []
+    masks_list: List[np.ndarray] = []
+    labels_list: List[int] = []
+    for inst in entry["instances"]:
+        poly = inst["poly"]
+        m = _rasterize_polygons([poly], (H0, W0))
+        if int(m.sum()) == 0:
+            continue
+        ys, xs = np.where(m > 0)
+        x1, x2 = float(xs.min()), float(xs.max())
+        y1, y2 = float(ys.min()), float(ys.max())
+        cid = _class_name_to_id(inst["class"])
+        if cid == 0:
+            continue
+        boxes_list.append([x1, y1, x2, y2])
+        masks_list.append(m.astype(np.uint8))
+        labels_list.append(cid)
+    if not boxes_list:
+        return {
+            "boxes": torch.zeros(0, 4, dtype=torch.float32),
+            "masks": torch.zeros(0, H0, W0, dtype=torch.uint8),
+            "labels": torch.zeros(0, dtype=torch.long),
+        }
+    return {
+        "boxes": torch.tensor(boxes_list, dtype=torch.float32),
+        "masks": torch.tensor(np.stack(masks_list, axis=0), dtype=torch.uint8),
+        "labels": torch.tensor(labels_list, dtype=torch.long),
+    }
+
+
+def annotations_to_semantic_mask_from_entry(entry: Dict[str, Any]) -> np.ndarray:
+    H0, W0 = entry["orig_size"]
+    out = np.zeros((H0, W0), dtype=np.uint8)
+    for inst in entry["instances"]:
+        cid = _class_name_to_id(inst["class"])
+        if cid == 0:
+            continue
+        m = _rasterize_polygons([inst["poly"]], (H0, W0))
+        out[m > 0] = cid
+    return out
+
+
+def resize_binary_mask(mask_np: np.ndarray, size: int) -> np.ndarray:
+    return cv2.resize(mask_np.astype(np.uint8), (size, size), interpolation=cv2.INTER_NEAREST)
+
+
+def scale_box_xyxy(box: np.ndarray, orig_w: int, orig_h: int, size: int) -> np.ndarray:
+    x1, y1, x2, y2 = [float(v) for v in box]
+    sx = size / float(orig_w)
+    sy = size / float(orig_h)
+    return np.array([x1 * sx, y1 * sy, x2 * sx, y2 * sy], dtype=np.float32)
+
+
+def sam2_set_trainable_parts(predictor: SAM2ImagePredictor, freeze_image_encoder: bool = True) -> None:
+    model = predictor.model
+    model.train()
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in model.sam_prompt_encoder.parameters():
+        p.requires_grad = True
+    for p in model.sam_mask_decoder.parameters():
+        p.requires_grad = True
+    model.sam_prompt_encoder.train(True)
+    model.sam_mask_decoder.train(True)
+    if hasattr(model, "image_encoder"):
+        if freeze_image_encoder:
+            model.image_encoder.eval()
+            for p in model.image_encoder.parameters():
+                p.requires_grad = False
+        else:
+            model.image_encoder.train(True)
+            for p in model.image_encoder.parameters():
+                p.requires_grad = True
+
+
+def binary_mask_loss_from_logits(logits: torch.Tensor, gt_mask: torch.Tensor) -> torch.Tensor:
+    gt_mask = gt_mask.float()
+    bce = F.binary_cross_entropy_with_logits(logits, gt_mask)
+    probs = torch.sigmoid(logits)
+    inter = (probs * gt_mask).sum(dim=(1, 2))
+    union = probs.sum(dim=(1, 2)) + gt_mask.sum(dim=(1, 2))
+    dice = 1.0 - ((2.0 * inter + 1e-6) / (union + 1e-6))
+    dice = dice.mean()
+    return bce + dice
+
+
+def _sam2_compute_loss_for_prompted_instance(
+    predictor: SAM2ImagePredictor,
+    box_xyxy: np.ndarray,
+    gt_mask_1hw: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Box is xyxy in resized image space; ``gt_mask_1hw`` is (1,H,W) float on device. Call inside ``autocast`` when using AMP.
+
+    Returns ``(loss, pixel_acc)`` where ``pixel_acc`` is detached (fraction of pixels where pred mask matches GT at 0.5 threshold).
+    """
+    _, _, _, unnorm_box = predictor._prep_prompts(
+        point_coords=None,
+        point_labels=None,
+        box=box_xyxy[None, :],
+        mask_logits=None,
+        normalize_coords=True,
+    )
+    sparse_embeddings, dense_embeddings = predictor.model.sam_prompt_encoder(
+        points=None,
+        boxes=unnorm_box,
+        masks=None,
+    )
+    high_res_features = [
+        feat_level[-1].unsqueeze(0) for feat_level in predictor._features["high_res_feats"]
+    ]
+    low_res_masks, prd_scores, _, _ = predictor.model.sam_mask_decoder(
+        image_embeddings=predictor._features["image_embed"],
+        image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),
+        sparse_prompt_embeddings=sparse_embeddings,
+        dense_prompt_embeddings=dense_embeddings,
+        multimask_output=False,
+        repeat_image=False,
+        high_res_features=high_res_features,
+    )
+    prd_masks = predictor._transforms.postprocess_masks(low_res_masks, predictor._orig_hw[-1])
+    prd_mask_logits = prd_masks[:, 0]
+    seg_loss = binary_mask_loss_from_logits(prd_mask_logits, gt_mask_1hw)
+    pred_binary = (torch.sigmoid(prd_mask_logits) > 0.5).float()
+    inter = (pred_binary * gt_mask_1hw).sum(dim=(1, 2))
+    union = pred_binary.sum(dim=(1, 2)) + gt_mask_1hw.sum(dim=(1, 2)) - inter
+    iou = inter / (union + 1e-6)
+    score_loss = torch.abs(prd_scores[:, 0] - iou).mean()
+    loss = seg_loss + 0.05 * score_loss
+    pixel_acc = pred_binary.eq(gt_mask_1hw).float().mean().detach()
+    return loss, pixel_acc
+
+
+def _sam2_clone_state_dict_cpu(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
+
+
+def _load_sam2_student_weights(predictor: SAM2ImagePredictor, resume_path: str, device: str) -> None:
+    try:
+        blob = torch.load(resume_path, map_location=device, weights_only=False)
+    except TypeError:
+        blob = torch.load(resume_path, map_location=device)
+    if isinstance(blob, dict) and "finetuned_state_dict" in blob:
+        state = blob["finetuned_state_dict"]
+    elif isinstance(blob, dict) and "model_state_dict" in blob:
+        state = blob["model_state_dict"]
+    elif isinstance(blob, dict) and "state_dict" in blob:
+        state = blob["state_dict"]
+    elif isinstance(blob, dict):
+        state = blob
+    else:
+        raise TypeError("Unexpected SAM2 checkpoint format")
+    predictor.model.load_state_dict(state, strict=False)
+
+
+def _save_sam2_training_latest(
+    path: str,
+    *,
+    predictor: SAM2ImagePredictor,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    epoch_next: int,
+    max_epochs: int,
+    early_stopper: EarlyStopping | None,
+    history: Dict[str, List[float]],
+    model_cfg_hydra: str,
+    stopped_early: bool,
+) -> None:
+    blob: Dict[str, Any] = {
+        "kind": SAM2_TRAINING_CKPT_KIND,
+        "model_cfg_hydra": model_cfg_hydra,
+        "base_config": str(MODEL_CFG),
+        "base_checkpoint": str(SAM2_BASE_CHECKPOINT),
+        "epoch_next": int(epoch_next),
+        "max_epochs": int(max_epochs),
+        "finetuned_state_dict": predictor.model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "history": {k: list(v) for k, v in history.items()},
+        "stopped_early": bool(stopped_early),
+    }
+    if early_stopper is not None:
+        blob["early_stopper_best_score"] = early_stopper.best_score
+        blob["early_stopper_counter"] = int(early_stopper.counter)
+        blob["early_stopper_patience"] = int(early_stopper.patience)
+        blob["early_stopper_min_delta"] = float(early_stopper.min_delta)
+        blob["early_stopper_mode"] = early_stopper.mode
+    torch.save(blob, path)
+
+
+def _save_sam2_training_best(
+    path: str,
+    *,
+    predictor: SAM2ImagePredictor,
+    epoch_1based: int,
+    val_loss: float,
+    model_cfg_hydra: str,
+) -> None:
+    torch.save(
+        {
+            "kind": SAM2_TRAINING_BEST_KIND,
+            "model_cfg_hydra": model_cfg_hydra,
+            "base_config": str(MODEL_CFG),
+            "base_checkpoint": str(SAM2_BASE_CHECKPOINT),
+            "epoch": int(epoch_1based),
+            "val_loss": float(val_loss),
+            "finetuned_state_dict": _sam2_clone_state_dict_cpu(predictor.model),
+        },
+        path,
+    )
+
+
+def _load_sam2_training_best_weights_cpu(path: str) -> Dict[str, torch.Tensor] | None:
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        try:
+            blob = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            blob = torch.load(path, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(blob, dict) or blob.get("kind") != SAM2_TRAINING_BEST_KIND:
+        return None
+    state = blob.get("finetuned_state_dict")
+    if not isinstance(state, dict):
+        return None
+    return {k: v.detach().cpu().clone() for k, v in state.items()}
+
+
+def _try_resume_sam2_training_from_latest(
+    path: str,
+    *,
+    predictor: SAM2ImagePredictor,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    early_stopper: EarlyStopping | None,
+    history: Dict[str, List[float]],
+    model_cfg_hydra: str,
+    device: str,
+) -> int:
+    """Load latest epoch checkpoint; return epoch_next (0-based index of next epoch to run)."""
+    if not os.path.isfile(path):
+        return 0
+    try:
+        try:
+            blob = torch.load(path, map_location=device, weights_only=False)
+        except TypeError:
+            blob = torch.load(path, map_location=device)
+    except Exception as e:
+        print(f"[WARN] Could not read latest training checkpoint: {e}", flush=True)
+        return 0
+    if not isinstance(blob, dict) or blob.get("kind") != SAM2_TRAINING_CKPT_KIND:
+        print("[WARN] Latest training checkpoint has wrong format; starting from epoch 0.", flush=True)
+        return 0
+    if str(blob.get("model_cfg_hydra", "")) != str(model_cfg_hydra):
+        print(
+            f"[WARN] Latest checkpoint cfg {blob.get('model_cfg_hydra')} != {model_cfg_hydra}; not resuming.",
+            flush=True,
+        )
+        return 0
+    if str(blob.get("base_checkpoint", "")) != str(SAM2_BASE_CHECKPOINT):
+        print("[WARN] Latest checkpoint base_checkpoint path differs from current; not resuming.", flush=True)
+        return 0
+    try:
+        predictor.model.load_state_dict(blob["finetuned_state_dict"], strict=False)
+    except Exception as e:
+        print(f"[WARN] Failed to load model state from latest checkpoint: {e}", flush=True)
+        return 0
+    try:
+        optimizer.load_state_dict(blob["optimizer_state_dict"])
+    except Exception as e:
+        print(f"[WARN] Failed to load optimizer state: {e}", flush=True)
+    try:
+        scaler.load_state_dict(blob["scaler_state_dict"])
+    except Exception as e:
+        print(f"[WARN] Failed to load scaler state: {e}", flush=True)
+    if early_stopper is not None:
+        if blob.get("early_stopper_best_score") is not None:
+            try:
+                early_stopper.best_score = float(blob["early_stopper_best_score"])
+            except (TypeError, ValueError):
+                early_stopper.best_score = None
+        early_stopper.counter = int(blob.get("early_stopper_counter", 0))
+    hist = blob.get("history")
+    if isinstance(hist, dict):
+        for key in history:
+            if key in hist and isinstance(hist[key], list):
+                history[key] = [float(x) for x in hist[key]]
+    epoch_next = int(blob.get("epoch_next", 0))
+    print(
+        f"[INFO] Resumed training from {path} (next epoch index {epoch_next}, "
+        f"{len(history.get('train_loss', []))} epochs in history).",
+        flush=True,
+    )
+    return max(0, epoch_next)
+
+
+def train_one_epoch_sam2(
+    predictor: SAM2ImagePredictor,
+    train_entries: List[Dict[str, Any]],
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler | None,
+    device: str,
+    max_instances_per_image: int = 8,
+    image_size: int = SAM2_PROMPT_IMAGE_SIZE,
+) -> Tuple[float, float]:
+    """Returns ``(mean_loss, mean_pixel_acc)`` over box-prompt instances (nan if no steps)."""
+    sam2_set_trainable_parts(predictor, freeze_image_encoder=SAM2_FREEZE_IMAGE_ENCODER)
+    running_losses: List[float] = []
+    running_accs: List[float] = []
+    shuffled = train_entries.copy()
+    random.shuffle(shuffled)
+    dev = torch.device(device)
+    autocast_enabled = dev.type == "cuda"
+    n_shuf = len(shuffled)
+    log_every = SAM2_TRAIN_LOG_EVERY
+
+    for i, entry in enumerate(shuffled, start=1):
+        try:
+            image = _read_rgb_for_prompt(entry["image_path"])
+        except FileNotFoundError:
+            continue
+        image_resized = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+        target = annotations_to_instance_targets_from_entry(entry)
+        if target["boxes"].shape[0] == 0:
+            continue
+
+        H0, W0 = entry["orig_size"]
+        predictor.set_image(image_resized)
+
+        boxes = target["boxes"].cpu().numpy()
+        masks = target["masks"].cpu().numpy()
+
+        idxs = list(range(len(boxes)))
+        random.shuffle(idxs)
+        idxs = idxs[:max_instances_per_image]
+
+        img_losses: List[float] = []
+        img_accs: List[float] = []
+
+        for idx in idxs:
+            box = scale_box_xyxy(boxes[idx], W0, H0, image_size)
+            gt_mask_np = resize_binary_mask(masks[idx], image_size)
+            if int(gt_mask_np.sum()) == 0:
+                continue
+
+            gt_mask = torch.tensor(gt_mask_np[None].astype(np.float32), device=device)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast("cuda", enabled=autocast_enabled):
+                loss, px_acc = _sam2_compute_loss_for_prompted_instance(predictor, box, gt_mask)
+
+            if scaler is not None and autocast_enabled:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            img_losses.append(float(loss.detach().cpu().item()))
+            img_accs.append(float(px_acc.cpu().item()))
+
+        if img_losses:
+            running_losses.append(float(np.mean(img_losses)))
+        if img_accs:
+            running_accs.append(float(np.mean(img_accs)))
+
+        if log_every > 0 and n_shuf and i % log_every == 0:
+            print(f"[INFO]   training progress: {i}/{n_shuf} images", flush=True)
+
+    mean_loss = float(np.mean(running_losses)) if running_losses else float("nan")
+    mean_acc = float(np.mean(running_accs)) if running_accs else float("nan")
+    return mean_loss, mean_acc
+
+
+@torch.no_grad()
+def eval_one_epoch_sam2_val_loss(
+    predictor: SAM2ImagePredictor,
+    val_entries: List[Dict[str, Any]],
+    device: str,
+    max_instances_per_image: int = 8,
+    image_size: int = SAM2_PROMPT_IMAGE_SIZE,
+) -> Tuple[float, float]:
+    """Mean box-prompt loss and pixel accuracy on the validation split (no backward)."""
+    if not val_entries:
+        return float("nan"), float("nan")
+    predictor.model.eval()
+    running_losses: List[float] = []
+    running_accs: List[float] = []
+    autocast_enabled = torch.device(device).type == "cuda"
+    n_val = len(val_entries)
+    log_every = SAM2_TRAIN_LOG_EVERY
+
+    for i, entry in enumerate(val_entries, start=1):
+        try:
+            image = _read_rgb_for_prompt(entry["image_path"])
+        except FileNotFoundError:
+            continue
+        image_resized = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+        target = annotations_to_instance_targets_from_entry(entry)
+        if target["boxes"].shape[0] == 0:
+            continue
+
+        H0, W0 = entry["orig_size"]
+        predictor.set_image(image_resized)
+
+        boxes = target["boxes"].cpu().numpy()
+        masks = target["masks"].cpu().numpy()
+
+        idxs = list(range(len(boxes)))[:max_instances_per_image]
+
+        img_losses: List[float] = []
+        img_accs: List[float] = []
+        for idx in idxs:
+            box = scale_box_xyxy(boxes[idx], W0, H0, image_size)
+            gt_mask_np = resize_binary_mask(masks[idx], image_size)
+            if int(gt_mask_np.sum()) == 0:
+                continue
+            gt_mask = torch.tensor(gt_mask_np[None].astype(np.float32), device=device)
+            with torch.amp.autocast("cuda", enabled=autocast_enabled):
+                loss, px_acc = _sam2_compute_loss_for_prompted_instance(predictor, box, gt_mask)
+            img_losses.append(float(loss.detach().cpu().item()))
+            img_accs.append(float(px_acc.cpu().item()))
+
+        if img_losses:
+            running_losses.append(float(np.mean(img_losses)))
+        if img_accs:
+            running_accs.append(float(np.mean(img_accs)))
+
+        if log_every > 0 and n_val and i % log_every == 0:
+            print(f"[INFO]   validation progress: {i}/{n_val} images", flush=True)
+
+    mean_loss = float(np.mean(running_losses)) if running_losses else float("nan")
+    mean_acc = float(np.mean(running_accs)) if running_accs else float("nan")
+    return mean_loss, mean_acc
+
+
+@torch.no_grad()
+def evaluate_sam2_prompted(
+    records: List[Dict[str, Any]],
+    predictor: SAM2ImagePredictor,
+    image_size: int = SAM2_PROMPT_IMAGE_SIZE,
+) -> Dict[str, Any]:
+    if not records:
+        return _empty_prompted_metrics()
+
+    predictor.model.eval()
+    pixel_accs: List[float] = []
+    iou_store: Dict[int, List[float]] = defaultdict(list)
+
+    for entry in records:
+        try:
+            image = _read_rgb_for_prompt(entry["image_path"])
+        except FileNotFoundError:
+            continue
+        image_resized = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+
+        gt_mask = annotations_to_semantic_mask_from_entry(entry)
+        gt_mask = cv2.resize(gt_mask, (image_size, image_size), interpolation=cv2.INTER_NEAREST)
+
+        predictor.set_image(image_resized)
+        pred_mask = np.zeros((image_size, image_size), dtype=np.uint8)
+
+        target = annotations_to_instance_targets_from_entry(entry)
+        if target["boxes"].shape[0] == 0:
+            pixel_accs.append(_compute_pixel_accuracy_semantic(pred_mask, gt_mask))
+            ious = _compute_iou_per_class_semantic(pred_mask, gt_mask, NUM_SAM2_CLASSES)
+            for cls_id, iou in ious.items():
+                iou_store[cls_id].append(iou)
+            continue
+
+        H0, W0 = entry["orig_size"]
+        boxes = target["boxes"].numpy().copy()
+        labels = target["labels"].numpy().copy()
+
+        sx = image_size / float(W0)
+        sy = image_size / float(H0)
+        boxes[:, [0, 2]] *= sx
+        boxes[:, [1, 3]] *= sy
+
+        masks, scores, _ = predictor.predict(
+            point_coords=None,
+            point_labels=None,
+            box=boxes,
+            multimask_output=False,
+        )
+
+        masks = np.asarray(masks)
+        if masks.ndim == 4:
+            masks = masks[:, 0]
+
+        order = np.argsort(np.asarray(scores).reshape(-1))
+        for idx in order:
+            m = masks[idx]
+            cls_id = int(labels[idx])
+            pred_mask[m > 0] = cls_id
+
+        pixel_accs.append(_compute_pixel_accuracy_semantic(pred_mask, gt_mask))
+        ious = _compute_iou_per_class_semantic(pred_mask, gt_mask, NUM_SAM2_CLASSES)
+        for cls_id, iou in ious.items():
+            iou_store[cls_id].append(iou)
+
+    metrics: Dict[str, Any] = {
+        "pixel_accuracy": _safe_nanmean(pixel_accs),
+        "mean_iou": _safe_nanmean([_safe_nanmean(v) for v in iou_store.values()]),
+    }
+    for cls_id in range(NUM_SAM2_CLASSES):
+        metrics[f"iou_{ID_TO_CLASS_SAM2[cls_id]}"] = _safe_nanmean(iou_store[cls_id])
+    return metrics
 
 
 # -------------------- Evaluation Utils --------------------
@@ -691,208 +1333,334 @@ def evaluate_on_validation(val_entries: List[Dict[str, Any]], predictor: SAM2Ima
 
 def main():
     """
-    Training entry point: build data, build model, optional resume, train, then evaluate.  # Docstring
+    Fine-tune SAM2 with GT box prompts (prompt encoder + mask decoder), save student checkpoint under
+    ``checkpoints_sam2/``, then report semantic segmentation metrics from box-prompted inference.
     """
     _validate_runtime_prerequisites()
-    device = "cuda" if torch.cuda.is_available() else "cpu"  # Select device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg_source = "env" if (os.getenv("SAM2_MODEL_CFG") or os.getenv("MODEL_CFG")) else "auto/default"
-    ckpt_source = "env" if os.getenv("SAM2_CHECKPOINT") else "auto/default"
     model_cfg_hydra = _to_hydra_config_name(MODEL_CFG)
     print(f"[INFO] SAM2 model cfg: {MODEL_CFG} (source: {cfg_source})")
     print(f"[INFO] SAM2 hydra cfg name: {model_cfg_hydra}")
-    print(f"[INFO] SAM2 checkpoint: {SAM2_CHECKPOINT} (source: {ckpt_source})")
-    ckpt_for_build = SAM2_CHECKPOINT if os.path.exists(SAM2_CHECKPOINT) else None
-    if ckpt_for_build is None:
-        print(
-            "[WARN] SAM2 pretrained checkpoint not found; continuing with random initialization.",
-            flush=True,
-        )
 
-    train_entries, val_entries = build_dataset(
+    if not os.path.isfile(SAM2_BASE_CHECKPOINT):
+        raise RuntimeError(
+            f"SAM2 base checkpoint not found: {SAM2_BASE_CHECKPOINT}\n"
+            "Place the matching Meta pretrained .pt for your YAML (e.g. sam2_hiera_large.pt) under "
+            "checkpoints_sam2/, or set SAM2_CHECKPOINT / SAM2_BASE_CHECKPOINT to its path."
+        )
+    print(f"[INFO] SAM2 base checkpoint: {SAM2_BASE_CHECKPOINT}", flush=True)
+
+    train_entries, val_entries, test_entries = build_dataset(
         IMAGES_DIR,
         ANNOT_JSON,
         train_split_txt=TRAIN_SPLIT_TXT,
         val_split_txt=VAL_SPLIT_TXT,
-    )  # Build splits
-    if not train_entries:  # Guard empty dataset
+        test_split_txt=TEST_SPLIT_TXT,
+    )
+    if not train_entries:
         raise RuntimeError(
             "No valid training entries found. Check the configured image/annotation paths and ensure the training images exist."
-        )  # Fail fast
-    print(f"[INFO] Train entries: {len(train_entries)} | Val entries: {len(val_entries)}")  # Log sizes
+        )
+    print(
+        f"[INFO] Train entries: {len(train_entries)} | Val entries: {len(val_entries)} | Test entries: {len(test_entries)}",
+        flush=True,
+    )
 
-    sam2_model = build_sam2(model_cfg_hydra, ckpt_for_build, device=device)  # Instantiate model from cfg+ckpt
-    predictor = SAM2ImagePredictor(sam2_model)  # Wrap model with predictor API
+    sam2_model = build_sam2(model_cfg_hydra, str(SAM2_BASE_CHECKPOINT), device=device)
+    predictor = SAM2ImagePredictor(sam2_model)
 
-    try:
-        if os.path.exists(MODEL_STATE_PATH):  # If checkpoint exists
-            state = torch.load(MODEL_STATE_PATH, map_location=device)  # Load state dict
-            predictor.model.load_state_dict(state, strict=False)  # Warm start
-            print(f"[INFO] Loaded existing checkpoint for warm start / resume: {MODEL_STATE_PATH}")  # Log resume
-    except Exception as e:
-        print("[WARN] Failed to load existing checkpoint:", e)  # Non-fatal warning
-
-    predictor.model.sam_mask_decoder.train(True)  # Enable training for mask decoder
-    predictor.model.sam_prompt_encoder.train(True)  # Enable training for prompt encoder
-    if TRAIN_IMAGE_ENCODER:  # Optionally also train image encoder
-        predictor.model.image_encoder.train(True)  # Set encoder to train
-        print("[WARN] TRAIN_IMAGE_ENCODER=True. Ensure no_grad is removed in upstream where needed.")  # Reminder
-
-    optimizer = torch.optim.AdamW(params=predictor.model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)  # AdamW optimizer
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))  # AMP gradient scaler (CUDA only)
-
-    _ensure_dir(CURVES_OUT_DIR)  # Create curve output directory
-    train_iou_hist: List[float] = []  # EMA train IoU history
-    val_iou_hist: List[float] = []  # Mini-val IoU history
-    steps_hist: List[int] = []  # Step indices for plotting
-
-    mean_iou = 0.0  # Initialize EMA IoU
-    for itr in range(STEPS):  # Main training loop
-        with torch.cuda.amp.autocast(enabled=(device == "cuda")):  # Mixed precision on GPU
-            images, masks, input_points, input_labels = read_batch(train_entries, batch_size=BATCH_SIZE)  # Sample batch
-            if masks.shape[0] == 0:  # Safety against empty batch
-                continue  # Skip iteration
-
-            predictor.set_image_batch(images)  # Encode batch of images
-
-            mask_input, unnorm_coords, labels, unnorm_box = predictor._prep_prompts(  # Prepare prompts
-                input_points, input_labels, box=None, mask_logits=None, normalize_coords=True  # Single positive point
-            )
-            sparse_embeddings, dense_embeddings = predictor.model.sam_prompt_encoder(  # Encode prompts
-                points=(unnorm_coords, labels), boxes=None, masks=None  # Only point prompts
-            )
-
-            high_res_features = [feat_level[-1].unsqueeze(0) for feat_level in predictor._features["high_res_feats"]]  # Hi-res feats per batch el.
-            low_res_masks, prd_scores, _, _ = predictor.model.sam_mask_decoder(  # Decode masks
-                image_embeddings=predictor._features["image_embed"],  # Image embeddings
-                image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),  # Positional encodings
-                sparse_prompt_embeddings=sparse_embeddings,  # Sparse (points) embeddings
-                dense_prompt_embeddings=dense_embeddings,  # Dense prompt embeddings
-                multimask_output=True,  # Multi outputs internally (we will select channel 0)
-                repeat_image=False,  # Images already batched
-                high_res_features=high_res_features,  # Hi-res skip features
-            )
-            prd_masks = predictor._transforms.postprocess_masks(low_res_masks, predictor._orig_hw[-1])  # Upsample to orig-hw (per item)
-
-            gt_mask = torch.tensor(masks.astype(np.float32), device=device)  # Cast GT masks to float tensor
-            prd_mask = torch.sigmoid(prd_masks[:, 0])  # Take first mask and apply sigmoid
-            seg_loss = (-gt_mask * torch.log(prd_mask + 1e-5) - (1 - gt_mask) * torch.log((1 - prd_mask) + 1e-5)).mean()  # BCE
-
-            inter = (gt_mask * (prd_mask > 0.5)).sum(1).sum(1)  # Intersection count per sample
-            denom = gt_mask.sum(1).sum(1) + (prd_mask > 0.5).sum(1).sum(1) - inter + 1e-6  # Union count with epsilon
-            iou = inter / denom  # IoU per sample
-            score_loss = torch.abs(prd_scores[:, 0] - iou).mean()  # Align score to IoU
-            loss = seg_loss + 0.05 * score_loss  # Total loss
-
-        predictor.model.zero_grad()  # Clear grads
-        scaler.scale(loss).backward()  # Backprop with scaling
-        scaler.step(optimizer)  # Optimizer step
-        scaler.update()  # Update scaler
-
-        if itr % SAVE_EVERY == 0:  # Periodic checkpoint
-            torch.save(predictor.model.state_dict(), MODEL_STATE_PATH)  # Save model
-            print("[INFO] Saved model at step", itr)  # Log save
-
-        mean_iou = 0.99 * mean_iou + 0.01 * float(iou.detach().mean().cpu().numpy())  # Update EMA IoU
-        if itr % 10 == 0:  # Logging cadence
-            print(f"step {itr:05d} | loss={float(loss):.4f} | IOU={mean_iou:.4f}")  # Console log
-            steps_hist.append(itr)  # Track step
-            train_iou_hist.append(mean_iou)  # Track train EMA IoU
-
-            val_iou_value = None  # Placeholder for mini-val IoU
-            if len(val_entries) > 0:  # If we have a val split
-                try:
-                    predictor.model.eval()  # Eval mode
-                    with torch.no_grad():  # Disable grad
-                        v_images, v_masks, v_points, v_labels = read_batch(val_entries, batch_size=min(BATCH_SIZE, len(val_entries)))  # Sample val
-                        if v_masks.shape[0] > 0:  # If not empty
-                            predictor.set_image_batch(v_images)  # Encode val images
-                            mask_input, unnorm_coords, labels, unnorm_box = predictor._prep_prompts(  # Prep prompts
-                                v_points, v_labels, box=None, mask_logits=None, normalize_coords=True  # Same as train
-                            )
-                            sparse_embeddings, dense_embeddings = predictor.model.sam_prompt_encoder(  # Prompt enc
-                                points=(unnorm_coords, labels), boxes=None, masks=None  # Points only
-                            )
-                            high_res_features = [feat_level[-1].unsqueeze(0) for feat_level in predictor._features["high_res_feats"]]  # Hi-res feats
-                            low_res_masks, prd_scores, _, _ = predictor.model.sam_mask_decoder(  # Decode
-                                image_embeddings=predictor._features["image_embed"],  # Embeddings
-                                image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),  # Positional enc
-                                sparse_prompt_embeddings=sparse_embeddings,  # Sparse prompts
-                                dense_prompt_embeddings=dense_embeddings,  # Dense prompts
-                                multimask_output=True,  # Multi
-                                repeat_image=False,  # Batched already
-                                high_res_features=high_res_features,  # Hi-res
-                            )
-                            prd_masks = predictor._transforms.postprocess_masks(low_res_masks, predictor._orig_hw[-1])  # Postprocess
-                            gt_mask_v = torch.tensor(v_masks.astype(np.float32), device=device)  # GT val masks
-                            prd_mask_v = torch.sigmoid(prd_masks[:, 0])  # Pred val masks (sigmoid)
-                            inter_v = (gt_mask_v * (prd_mask_v > 0.5)).sum(1).sum(1)  # Intersection
-                            denom_v = gt_mask_v.sum(1).sum(1) + (prd_mask_v > 0.5).sum(1).sum(1) - inter_v + 1e-6  # Union
-                            iou_v = inter_v / denom_v  # IoU
-                            val_iou_value = float(iou_v.detach().mean().cpu().numpy())  # Mean val IoU
-                except Exception:
-                    val_iou_value = None  # Swallow errors in quick val
-                finally:
-                    predictor.model.sam_mask_decoder.train(True)  # Back to train mode decoder
-                    predictor.model.sam_prompt_encoder.train(True)  # Back to train mode prompts
-                    if TRAIN_IMAGE_ENCODER:  # If encoder training enabled
-                        predictor.model.image_encoder.train(True)  # Back to train mode encoder
-
-            if val_iou_value is not None:  # If val IoU computed
-                val_iou_hist.append(val_iou_value)  # Record value
-            else:
-                if len(val_iou_hist) < len(train_iou_hist):  # Keep arrays aligned
-                    val_iou_hist.append(np.nan)  # Insert NaN placeholder
-
+    resume_from_latest = SAM2_RESUME_TRAINING and os.path.isfile(SAM2_TRAINING_LATEST)
+    if resume_from_latest:
+        print(f"[INFO] SAM2_RESUME set: will load mid-run state from {SAM2_TRAINING_LATEST} if valid.", flush=True)
+    if not resume_from_latest:
+        resume_path = None
+        for candidate in (MODEL_STATE_PATH, MODEL_STATE_LEGACY):
+            if candidate and os.path.isfile(candidate):
+                resume_path = candidate
+                break
+        if resume_path is not None:
             try:
-                import matplotlib.pyplot as plt  # Plot curves
-                plt.figure(figsize=(7, 4))  # New fig
-                plt.plot(steps_hist, train_iou_hist, label="Train IoU (EMA)", color="#1f77b4")  # Train curve
-                plt.plot(steps_hist, val_iou_hist, label="Val IoU (mini-batch)", color="#ff7f0e")  # Val curve
-                plt.xlabel("Step")  # X label
-                plt.ylabel("IoU")  # Y label
-                plt.ylim(0.0, 1.0)  # Bounds
-                plt.title("IoU vs Steps (Train vs Val)")  # Title
-                plt.legend()  # Legend
-                plt.tight_layout()  # Layout
-                plt.savefig(os.path.join(CURVES_OUT_DIR, "iou_train_vs_val.png"))  # Save figure
-                plt.close()  # Close fig
-            except Exception:
-                pass  # Ignore plotting issues
+                _load_sam2_student_weights(predictor, resume_path, device)
+                print(f"[INFO] Loaded student checkpoint for warm start / resume: {resume_path}", flush=True)
+            except Exception as e:
+                print("[WARN] Failed to load existing student checkpoint:", e, flush=True)
 
-    torch.save(predictor.model.state_dict(), MODEL_STATE_PATH)  # Final checkpoint save
-    print(f"[DONE] Training complete. Saved {MODEL_STATE_PATH}")  # Completion log
+    sam2_set_trainable_parts(predictor, freeze_image_encoder=SAM2_FREEZE_IMAGE_ENCODER)
+    trainable_params = [p for p in predictor.model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable SAM2 parameters were enabled; check sam2_set_trainable_parts.")
+
+    optimizer = torch.optim.AdamW(
+        params=trainable_params,
+        lr=SAM2_TRAIN_LR,
+        weight_decay=SAM2_TRAIN_WEIGHT_DECAY,
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
+
+    _ensure_dir(CURVES_OUT_DIR)
+    history: Dict[str, List[float]] = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": [],
+    }
+
+    use_early_stop = SAM2_EARLY_STOPPING_PATIENCE > 0 and len(val_entries) > 0
+    early_stopper: EarlyStopping | None = None
+    if use_early_stop:
+        early_stopper = EarlyStopping(
+            patience=SAM2_EARLY_STOPPING_PATIENCE,
+            min_delta=SAM2_EARLY_STOPPING_MIN_DELTA,
+            mode="min",
+        )
+        print(
+            f"[INFO] Early stopping: patience={SAM2_EARLY_STOPPING_PATIENCE} "
+            f"min_delta={SAM2_EARLY_STOPPING_MIN_DELTA} (monitor=val_loss)",
+            flush=True,
+        )
+    elif SAM2_EARLY_STOPPING_PATIENCE > 0 and not val_entries:
+        print("[WARN] Early stopping requested but val split is empty; training full epoch budget.", flush=True)
+
+    start_epoch = 0
+    best_weights: Dict[str, torch.Tensor] | None = None
+    if resume_from_latest:
+        start_epoch = _try_resume_sam2_training_from_latest(
+            SAM2_TRAINING_LATEST,
+            predictor=predictor,
+            optimizer=optimizer,
+            scaler=scaler,
+            early_stopper=early_stopper,
+            history=history,
+            model_cfg_hydra=model_cfg_hydra,
+            device=device,
+        )
+        resumed_ok = start_epoch > 0 or any(history.get(k) for k in history)
+        if not resumed_ok:
+            print(
+                "[WARN] SAM2_RESUME set but latest checkpoint was not applied; "
+                "falling back to inference export warm start if present.",
+                flush=True,
+            )
+            for candidate in (MODEL_STATE_PATH, MODEL_STATE_LEGACY):
+                if candidate and os.path.isfile(candidate):
+                    try:
+                        _load_sam2_student_weights(predictor, candidate, device)
+                        print(f"[INFO] Warm start from {candidate}", flush=True)
+                    except Exception as e:
+                        print("[WARN] Warm start failed:", e, flush=True)
+                    break
+        if resumed_ok:
+            bw = _load_sam2_training_best_weights_cpu(SAM2_TRAINING_BEST)
+            if bw is not None:
+                best_weights = bw
+                print(
+                    "[INFO] Loaded best validation weights from "
+                    f"{SAM2_TRAINING_BEST} for end-of-run restore.",
+                    flush=True,
+                )
+
+    stopped_early = False
+    epoch_done = start_epoch
+
+    if start_epoch >= SAM2_TRAIN_EPOCHS:
+        print(
+            f"[INFO] Latest checkpoint epoch_next={start_epoch} >= max_epochs={SAM2_TRAIN_EPOCHS}; "
+            "skipping training loop.",
+            flush=True,
+        )
+    else:
+        for epoch in range(start_epoch, SAM2_TRAIN_EPOCHS):
+            t_epoch0 = time.perf_counter()
+            print(
+                f"[INFO] Epoch {epoch + 1}/{SAM2_TRAIN_EPOCHS}: training ({len(train_entries)} images)...",
+                flush=True,
+            )
+            train_loss, train_acc = train_one_epoch_sam2(
+                predictor,
+                train_entries,
+                optimizer,
+                scaler,
+                device,
+                max_instances_per_image=SAM2_MAX_INSTANCES_PER_IMAGE,
+                image_size=SAM2_PROMPT_IMAGE_SIZE,
+            )
+            history["train_loss"].append(train_loss)
+            history["train_acc"].append(train_acc)
+
+            val_loss = float("nan")
+            val_acc = float("nan")
+            if val_entries:
+                print(
+                    f"[INFO] Epoch {epoch + 1}/{SAM2_TRAIN_EPOCHS}: validation ({len(val_entries)} images)...",
+                    flush=True,
+                )
+                val_loss, val_acc = eval_one_epoch_sam2_val_loss(
+                    predictor,
+                    val_entries,
+                    device,
+                    max_instances_per_image=SAM2_MAX_INSTANCES_PER_IMAGE,
+                    image_size=SAM2_PROMPT_IMAGE_SIZE,
+                )
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
+
+            epoch_sec = time.perf_counter() - t_epoch0
+
+            log_msg = f"Epoch {epoch + 1}/{SAM2_TRAIN_EPOCHS} | train_loss={train_loss:.4f}"
+            if not math.isnan(train_acc):
+                log_msg += f" | train_acc={train_acc:.4f}"
+            if val_entries and not math.isnan(val_loss):
+                log_msg += f" | val_loss={val_loss:.4f}"
+            if val_entries and not math.isnan(val_acc):
+                log_msg += f" | val_acc={val_acc:.4f}"
+
+            stop_now = False
+            improved = False
+            can_early_stop = early_stopper is not None and not math.isnan(val_loss)
+            if can_early_stop:
+                improved, stop_now = early_stopper.step(val_loss)
+                log_msg += f" | Patience: {early_stopper.counter}/{early_stopper.patience}"
+
+            log_msg += f" | Time: {epoch_sec:.1f}s"
+
+            print(log_msg, flush=True)
+
+            epoch_done = epoch + 1
+
+            if can_early_stop and improved:
+                best_weights = _sam2_clone_state_dict_cpu(predictor.model)
+                print(
+                    f"[INFO] val_loss improved to {val_loss:.4f} (best); saving snapshot for restore.",
+                    flush=True,
+                )
+                _save_sam2_training_best(
+                    SAM2_TRAINING_BEST,
+                    predictor=predictor,
+                    epoch_1based=epoch_done,
+                    val_loss=float(val_loss),
+                    model_cfg_hydra=model_cfg_hydra,
+                )
+                print(f"[INFO] Wrote best val checkpoint: {SAM2_TRAINING_BEST}", flush=True)
+
+            if can_early_stop and stop_now:
+                stopped_early = True
+                print(
+                    f"[INFO] Early stopping: no val_loss improvement for {SAM2_EARLY_STOPPING_PATIENCE} epochs.",
+                    flush=True,
+                )
+
+            _save_sam2_training_latest(
+                SAM2_TRAINING_LATEST,
+                predictor=predictor,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch_next=epoch_done,
+                max_epochs=SAM2_TRAIN_EPOCHS,
+                early_stopper=early_stopper,
+                history=history,
+                model_cfg_hydra=model_cfg_hydra,
+                stopped_early=stopped_early,
+            )
+            print(
+                f"[INFO] Wrote latest training checkpoint: {SAM2_TRAINING_LATEST} (epoch_next={epoch_done})",
+                flush=True,
+            )
+
+            if can_early_stop and stop_now:
+                break
+
+    if best_weights is not None:
+        predictor.model.load_state_dict(best_weights)
+        print("[INFO] Restored weights from best val_loss checkpoint.", flush=True)
+
+    sam2_ckpt = {
+        "model_name": "SAM2_Hiera_Finetuned_TreeCanopy",
+        "base_config": str(MODEL_CFG),
+        "base_checkpoint": str(SAM2_BASE_CHECKPOINT),
+        "finetuned_state_dict": predictor.model.state_dict(),
+        "train_epochs": epoch_done,
+        "max_epochs": SAM2_TRAIN_EPOCHS,
+        "image_size": SAM2_PROMPT_IMAGE_SIZE,
+        "early_stopping": {
+            "patience": SAM2_EARLY_STOPPING_PATIENCE,
+            "min_delta": SAM2_EARLY_STOPPING_MIN_DELTA,
+            "stopped_early": stopped_early,
+            "best_val_loss": early_stopper.best_score if early_stopper else None,
+        },
+    }
+    torch.save(sam2_ckpt, SAM2_FINETUNED_WEIGHTS)
+    print(f"[DONE] Saved SAM2 finetuned checkpoint to: {SAM2_FINETUNED_WEIGHTS}", flush=True)
 
     try:
-        predictor.model.eval()  # Eval mode before full validation
-        if device == "cuda":  # If GPU
-            torch.cuda.empty_cache()  # Free cached memory
-        evaluate_on_validation(val_entries, predictor, device=device)  # Run evaluation
-    except Exception as e:
-        print("[WARN] Validation evaluation failed:", e)  # Non-fatal warning
+        import matplotlib.pyplot as plt
 
-    import time as _time
-    final_train_iou = train_iou_hist[-1] if train_iou_hist else None
-    final_val_iou = val_iou_hist[-1] if val_iou_hist else None
-    if final_val_iou is not None and (final_val_iou != final_val_iou):
-        final_val_iou = None
-    training_results = {
+        if history["train_loss"]:
+            plt.figure(figsize=(7, 4))
+            ep = range(1, len(history["train_loss"]) + 1)
+            plt.plot(ep, history["train_loss"], color="#1f77b4", label="train_loss")
+            if history["val_loss"] and any(not math.isnan(v) for v in history["val_loss"]):
+                plt.plot(ep, history["val_loss"], color="#ff7f0e", label="val_loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title("SAM2 box-prompt fine-tuning")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(CURVES_OUT_DIR, "sam2_prompt_train_loss.png"))
+            plt.close()
+    except Exception as e:
+        print("[WARN] Could not plot train loss curve:", e)
+
+    predictor.model.eval()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    train_metrics = evaluate_sam2_prompted(train_entries, predictor, image_size=SAM2_PROMPT_IMAGE_SIZE)
+    val_metrics = evaluate_sam2_prompted(val_entries, predictor, image_size=SAM2_PROMPT_IMAGE_SIZE)
+    test_metrics = (
+        evaluate_sam2_prompted(test_entries, predictor, image_size=SAM2_PROMPT_IMAGE_SIZE)
+        if test_entries
+        else None
+    )
+
+    if SAM2_GRID_EVAL and val_entries:
+        try:
+            evaluate_on_validation(val_entries, predictor, device=device)
+        except Exception as e:
+            print("[WARN] Optional grid-point validation failed:", e)
+
+    tr_m = float(train_metrics.get("mean_iou", float("nan")))
+    va_m = float(val_metrics.get("mean_iou", float("nan")))
+    te_m = float(test_metrics.get("mean_iou", float("nan"))) if test_metrics else float("nan")
+
+    training_results: Dict[str, Any] = {
         "method": "sam2",
-        "train_accuracy": round(final_train_iou, 6) if final_train_iou is not None else None,
-        "val_accuracy": round(final_val_iou, 6) if final_val_iou is not None else None,
-        "test_accuracy": None,
-        "metric_type": "iou",
-        "steps": STEPS,
-        "timestamp": int(_time.time()),
+        "train_accuracy": _optional_round_mean_iou(train_metrics),
+        "val_accuracy": _optional_round_mean_iou(val_metrics),
+        "test_accuracy": _optional_round_mean_iou(test_metrics) if test_metrics is not None else None,
+        "metric_type": "mean_iou",
+        "epochs": epoch_done,
+        "max_epochs": SAM2_TRAIN_EPOCHS,
+        "early_stopping": sam2_ckpt.get("early_stopping"),
+        "prompted_eval_train": _metric_dict_for_json(train_metrics),
+        "prompted_eval_val": _metric_dict_for_json(val_metrics),
+        "history": history,
+        "timestamp": int(time.time()),
     }
+    if test_metrics is not None:
+        training_results["prompted_eval_test"] = _metric_dict_for_json(test_metrics)
+
     _ensure_dir(EVAL_OUT_DIR)
     results_path = os.path.join(EVAL_OUT_DIR, "training_results.json")
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(training_results, f, indent=2)
     print(
-        f"[SAM2] Results: train_iou={final_train_iou:.4f if final_train_iou else 'N/A'}"
-        f" val_iou={final_val_iou:.4f if final_val_iou else 'N/A'}",
+        f"[SAM2] Prompted eval — train mean_iou={tr_m:.4f} val mean_iou={va_m:.4f}",
         flush=True,
     )
+    if test_metrics is not None and not math.isnan(te_m):
+        print(f"[SAM2] Prompted eval — test mean_iou={te_m:.4f}", flush=True)
+    print(f"[SAM2] Wrote {results_path}", flush=True)
 
 
 if __name__ == "__main__":  # Standard Python entrypoint check

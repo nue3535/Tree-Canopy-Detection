@@ -1,3 +1,6 @@
+"""SegFormer aligned with tree_canopy_multimodel_training_evaluation_fixed.ipynb:
+nvidia/segformer-b2-finetuned-ade-512-512, num_labels=3; 512, batch 2, 50 epochs, AdamW 1e-4 / wd 1e-4, DiceCELoss, multimodel aug."""
+
 from __future__ import annotations
 
 import argparse
@@ -22,29 +25,42 @@ try:
 except Exception as exc:  # pragma: no cover - runtime environment dependent
     raise RuntimeError("transformers is required for SegFormer training.") from exc
 
+from backend.app.data_layout import (
+    resolve_evaluation_annotations_path,
+    resolve_evaluation_image_dir,
+    resolve_train_annotations_path,
+    resolve_train_image_dir,
+)
+
 try:
-    from backend.scripts.training_utils import CombinedLoss, EarlyStopping, apply_augmentation
+    from backend.scripts.training_utils import (
+        DiceCELoss,
+        EarlyStopping,
+        apply_augmentation,
+        make_multimodel_nb_train_transform,
+        make_multimodel_nb_val_transform,
+    )
 except ImportError:
-    from training_utils import CombinedLoss, EarlyStopping, apply_augmentation
+    from training_utils import (
+        DiceCELoss,
+        EarlyStopping,
+        apply_augmentation,
+        make_multimodel_nb_train_transform,
+        make_multimodel_nb_val_transform,
+    )
+
+try:
+    from backend.scripts.deeplab_v3plus_workflow import get_transform as _seg_preproc_transform
+except ImportError:
+    from deeplab_v3plus_workflow import get_transform as _seg_preproc_transform
 
 
 SUPPORTED_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+SEGFORMER_PRETRAINED_ID = "nvidia/segformer-b2-finetuned-ade-512-512"
 
 
 def _resolve_image_dir(project_root: Path) -> Path:
-    candidates = [
-        project_root / "data" / "raw" / "train_images",
-        project_root / "data" / "raw" / "train_images_tif",
-        project_root / "data" / "raw" / "train_images_png",
-    ]
-    first_existing = None
-    for path in candidates:
-        if path.exists() and path.is_dir():
-            if first_existing is None:
-                first_existing = path
-            if any(p.suffix.lower() in SUPPORTED_SUFFIXES for p in path.iterdir() if p.is_file()):
-                return path
-    return first_existing or candidates[0]
+    return resolve_train_image_dir(project_root)
 
 
 def _find_image_path(image_dir: Path, stem: str) -> Path | None:
@@ -83,18 +99,30 @@ class TrainConfig:
     annotations_path: Path
     image_dir: Path
     save_dir: Path
-    img_size: int = 1024
-    batch_size: int = 8
-    epochs: int = 20
+    img_size: int = 512
+    batch_size: int = 2
+    epochs: int = 50
     lr: float = 1e-4
-    workers: int = 0
+    weight_decay: float = 1e-4
+    workers: int = 2
+    augment_style: str = "multimodel"
 
 
 class SegFormerDataset(Dataset):
-    def __init__(self, records: list[dict], img_size: int, training: bool = True):
+    def __init__(
+        self,
+        records: list[dict],
+        img_size: int,
+        training: bool = True,
+        augment_style: str = "multimodel",
+    ):
         self.records = records
         self.img_size = img_size
         self.training = training
+        self.augment_style = augment_style
+        if augment_style == "multimodel":
+            self._train_tf = make_multimodel_nb_train_transform(img_size)
+            self._val_tf = make_multimodel_nb_val_transform(img_size)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -105,7 +133,19 @@ class SegFormerDataset(Dataset):
         if image is None:
             raise FileNotFoundError(f"Could not read image: {record['image_path']}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mask = record["mask"]
+        mask = record["mask"].astype(np.uint8)
+
+        if self.augment_style == "multimodel":
+            if self.training:
+                out = self._train_tf(image=image, mask=mask)
+            else:
+                out = self._val_tf(image=image, mask=mask)
+            m = out["mask"]
+            if m.dtype != torch.long:
+                m = m.long()
+            m = torch.clamp(m, 0, 2)
+            return out["image"], m
+
         image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
         if self.training:
@@ -164,22 +204,6 @@ def _mean_iou(pred: torch.Tensor, target: torch.Tensor, num_classes: int = 3) ->
     return float(np.mean(ious))
 
 
-def _resolve_eval_image_dir(project_root: Path) -> Path:
-    candidates = [
-        project_root / "data" / "raw" / "evaluation_images",
-        project_root / "data" / "raw" / "evaluation_images_tif",
-        project_root / "data" / "raw" / "evaluation_images_png",
-    ]
-    first_existing = None
-    for path in candidates:
-        if path.exists() and path.is_dir():
-            if first_existing is None:
-                first_existing = path
-            if any(p.suffix.lower() in SUPPORTED_SUFFIXES for p in path.iterdir() if p.is_file()):
-                return path
-    return first_existing or candidates[0]
-
-
 def _compute_pixel_accuracy(
     model: torch.nn.Module, loader: DataLoader, device: torch.device,
 ) -> float:
@@ -202,13 +226,13 @@ def _compute_pixel_accuracy(
 def _compute_test_accuracy(
     model: torch.nn.Module, config: TrainConfig, device: torch.device,
 ) -> float | None:
-    eval_annot = config.project_root / "data" / "raw" / "annotations" / "evaluation_annotations.json"
+    eval_annot = resolve_evaluation_annotations_path(config.project_root)
     if not eval_annot.exists():
         return None
     try:
         payload = json.loads(eval_annot.read_text(encoding="utf-8"))
         records: list[dict] = []
-        eval_image_dir = _resolve_eval_image_dir(config.project_root)
+        eval_image_dir = resolve_evaluation_image_dir(config.project_root)
         for img_info in payload.get("images", []):
             stem = Path(img_info.get("file_name", "")).stem
             if not stem:
@@ -224,7 +248,7 @@ def _compute_test_accuracy(
         if not records:
             return None
         loader = DataLoader(
-            SegFormerDataset(records, config.img_size),
+            SegFormerDataset(records, config.img_size, augment_style=config.augment_style),
             batch_size=config.batch_size, shuffle=False, num_workers=0,
         )
         return _compute_pixel_accuracy(model, loader, device)
@@ -232,12 +256,23 @@ def _compute_test_accuracy(
         return None
 
 
-def _predict_mask(model: torch.nn.Module, image_bgr: np.ndarray, img_size: int, device: torch.device) -> np.ndarray:
+def _predict_mask(
+    model: torch.nn.Module,
+    image_bgr: np.ndarray,
+    img_size: int,
+    device: torch.device,
+    imagenet_norm: bool = True,
+) -> np.ndarray:
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(image_rgb, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
-    tensor = torch.from_numpy(resized).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
+    tensor = _seg_preproc_transform(img_size, imagenet_norm=imagenet_norm)(image_rgb).unsqueeze(0).to(device)
     with torch.no_grad():
         logits = model(pixel_values=tensor).logits
+        logits = torch.nn.functional.interpolate(
+            logits,
+            size=(img_size, img_size),
+            mode="bilinear",
+            align_corners=False,
+        )
         pred_small = torch.argmax(logits, dim=1)[0].detach().cpu().numpy().astype(np.uint8)
     pred = cv2.resize(pred_small, (image_bgr.shape[1], image_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
     return pred
@@ -267,7 +302,9 @@ def _save_evaluation_artifacts(
         if image_bgr is None:
             continue
         gt_mask = record["mask"].astype(np.uint8)
-        pred_mask = _predict_mask(model, image_bgr, config.img_size, device)
+        pred_mask = _predict_mask(
+            model, image_bgr, config.img_size, device, imagenet_norm=config.augment_style == "multimodel",
+        )
 
         for cls in range(3):
             gt_idx = gt_mask == cls
@@ -361,21 +398,35 @@ def train(config: TrainConfig) -> None:
         flush=True,
     )
     train_loader = DataLoader(
-        SegFormerDataset(train_records, config.img_size, training=True),
+        SegFormerDataset(
+            train_records, config.img_size, training=True, augment_style=config.augment_style,
+        ),
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.workers,
     )
     val_loader = DataLoader(
-        SegFormerDataset(val_records, config.img_size, training=False),
+        SegFormerDataset(
+            val_records, config.img_size, training=False, augment_style=config.augment_style,
+        ),
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.workers,
     )
 
     try:
+        processor = SegformerImageProcessor.from_pretrained(SEGFORMER_PRETRAINED_ID)
+    except Exception:
+        processor = SegformerImageProcessor(
+            do_resize=True,
+            size={"height": config.img_size, "width": config.img_size},
+            do_rescale=True,
+            do_normalize=True,
+        )
+
+    try:
         model = SegformerForSemanticSegmentation.from_pretrained(
-            "nvidia/segformer-b0-finetuned-ade-512-512",
+            SEGFORMER_PRETRAINED_ID,
             num_labels=3,
             ignore_mismatched_sizes=True,
         ).to(device)
@@ -390,15 +441,10 @@ def train(config: TrainConfig) -> None:
         )
         model = SegformerForSemanticSegmentation(model_cfg).to(device)
         print("[SegFormer] pretrained unavailable, training from scratch", flush=True)
-    processor = SegformerImageProcessor(
-        do_resize=True,
-        size={"height": config.img_size, "width": config.img_size},
-        do_rescale=False,
-        do_normalize=False,
-    )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
-    criterion = CombinedLoss(num_classes=3)
-    early_stopping = EarlyStopping(patience=10)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    criterion = DiceCELoss(num_classes=3)
+    early_stopping = EarlyStopping(patience=999)
 
     best_iou = -1.0
     for epoch in range(config.epochs):
@@ -458,7 +504,9 @@ def train(config: TrainConfig) -> None:
 
     print("[SegFormer] Computing training results...", flush=True)
     train_eval_loader = DataLoader(
-        SegFormerDataset(train_records, config.img_size, training=False),
+        SegFormerDataset(
+            train_records, config.img_size, training=False, augment_style=config.augment_style,
+        ),
         batch_size=config.batch_size, shuffle=False, num_workers=config.workers,
     )
     train_acc = _compute_pixel_accuracy(model, train_eval_loader, device)
@@ -474,6 +522,7 @@ def train(config: TrainConfig) -> None:
         "best_val_iou": round(best_iou, 6),
         "epochs": config.epochs,
         "timestamp": int(time.time()),
+        "config_note": f"Aligned with multimodel notebook: {SEGFORMER_PRETRAINED_ID}, 512, batch 2, 50 epochs, DiceCELoss, multimodel Albumentations.",
     }
     (eval_root / "training_results.json").write_text(
         json.dumps(training_results, indent=2), encoding="utf-8",
@@ -490,11 +539,18 @@ def train(config: TrainConfig) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SegFormer training workflow")
     parser.add_argument("action", choices=["train"], default="train")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--img-size", type=int, default=1024)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--img-size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument(
+        "--augment-style",
+        type=str,
+        choices=["multimodel", "opencv"],
+        default="multimodel",
+    )
     return parser.parse_args()
 
 
@@ -503,14 +559,16 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[2]
     config = TrainConfig(
         project_root=project_root,
-        annotations_path=project_root / "data" / "raw" / "annotations" / "train_annotations.json",
+        annotations_path=resolve_train_annotations_path(project_root),
         image_dir=_resolve_image_dir(project_root),
         save_dir=project_root / "checkpoints_segformer",
         img_size=args.img_size,
         batch_size=args.batch_size,
         epochs=args.epochs,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         workers=args.workers,
+        augment_style=args.augment_style,
     )
     if args.action == "train":
         train(config)

@@ -12,14 +12,7 @@ from pydantic import BaseModel
 os.environ.setdefault("MPLCONFIGDIR", str(Path(".").resolve() / ".mplconfig"))
 
 from backend.app.evaluation import EvaluationService
-from backend.app.inference import (
-    DeepLabSegmentationService,
-    MaskRCNNSegmentationService,
-    SAM2SegmentationService,
-    SegFormerSegmentationService,
-    UNetSegmentationService,
-    get_method_precheck,
-)
+from backend.app.inference import SAM2SegmentationService, get_method_precheck
 from backend.app.training import TrainingManager
 
 app = FastAPI(title="Tree Canopy Segmentation API", version="1.0.0")
@@ -31,17 +24,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-service = DeepLabSegmentationService()
 sam2_service = SAM2SegmentationService()
-unet_service = UNetSegmentationService()
-maskrcnn_service = MaskRCNNSegmentationService()
-segformer_service = SegFormerSegmentationService()
 SEGMENTATION_SERVICES = {
-    "deeplabv3plus": service,
     "sam2": sam2_service,
-    "unet": unet_service,
-    "maskrcnn": maskrcnn_service,
-    "segformer": segformer_service,
 }
 TRAINABLE_METHODS = set(SEGMENTATION_SERVICES.keys())
 evaluation_service = EvaluationService(SEGMENTATION_SERVICES)
@@ -89,16 +74,6 @@ class EvaluationPageResponse(BaseModel):
     items: list[dict]
 
 
-class TrainingStartResponse(BaseModel):
-    method: str
-    profile: str
-    status: str
-    started_at: int
-    pid: int
-    command: list[str]
-    log_path: str
-
-
 class TrainingStatusResponse(BaseModel):
     method: str
     profile: str | None = None
@@ -137,7 +112,7 @@ def health() -> HealthResponse:
 @app.post("/api/segment", response_model=SegmentResponse)
 async def segment_image(
     file: UploadFile = File(...),
-    method: str = Form("deeplabv3plus"),
+    method: str = Form("sam2"),
     strict_conservation_mode: bool = Form(False),
 ) -> SegmentResponse:
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -153,7 +128,7 @@ async def segment_image(
         if selected_service is None:
             raise HTTPException(
                 status_code=400,
-                detail="Invalid method. Supported values: deeplabv3plus, sam2, unet, maskrcnn, segformer.",
+                detail="Invalid method. Only sam2 is enabled.",
             )
         result = selected_service.segment_bytes(
             payload,
@@ -184,7 +159,8 @@ def evaluation_summary(force: bool = False) -> EvaluationSummaryResponse:
 @app.get("/api/evaluation/precheck", response_model=EvaluationPrecheckResponse)
 def evaluation_precheck() -> EvaluationPrecheckResponse:
     try:
-        payload = get_method_precheck()
+        enabled = set(SEGMENTATION_SERVICES.keys())
+        payload = {k: v for k, v in get_method_precheck().items() if k in enabled}
         any_risk = any(not bool(v.get("ready_for_model_inference")) for v in payload.values())
         return EvaluationPrecheckResponse(
             generated_at=int(time.time()),
@@ -231,7 +207,7 @@ def evaluation_page(
     if method_key not in valid_methods:
         raise HTTPException(
             status_code=400,
-            detail="method must be one of: deeplabv3plus, sam2, unet, maskrcnn, segformer, all.",
+            detail="method must be one of: sam2, all.",
         )
     page_size = max(1, min(page_size, 50))
 
@@ -249,14 +225,14 @@ def evaluation_page(
         raise HTTPException(status_code=500, detail=f"Evaluation pagination failed: {exc}") from exc
 
 
-@app.post("/api/evaluation/train", response_model=TrainingStartResponse)
-def start_training(method: str = Form(...), profile: str = Form("best-quality")) -> TrainingStartResponse:
+@app.post("/api/evaluation/train", response_model=TrainingStatusResponse)
+def start_training(method: str = Form(...), profile: str = Form("best-quality")) -> TrainingStatusResponse:
     method_key = method.strip().lower()
     profile_key = profile.strip().lower()
     if method_key not in TRAINABLE_METHODS:
         raise HTTPException(
             status_code=400,
-            detail="method must be one of: deeplabv3plus, sam2, unet, maskrcnn, segformer.",
+            detail="method must be one of: sam2.",
         )
     if profile_key not in TrainingManager.SUPPORTED_PROFILES:
         raise HTTPException(
@@ -264,16 +240,16 @@ def start_training(method: str = Form(...), profile: str = Form("best-quality"))
             detail="profile must be best-quality.",
         )
     try:
-        state = training_manager.start_training(method_key, profile=profile_key)
-        return TrainingStartResponse(
-            method=state.method,
-            profile=state.profile,
-            status=state.status,
-            started_at=int(state.started_at),
-            pid=state.pid,
-            command=state.command,
-            log_path=str(state.log_path),
-        )
+        training_manager.start_training(method_key, profile=profile_key)
+        payload = training_manager.get_status(method_key)
+        return TrainingStatusResponse(**payload)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+        ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Training start failed: {exc}") from exc
 
@@ -284,7 +260,7 @@ def training_status(method: str) -> TrainingStatusResponse:
     if method_key not in TRAINABLE_METHODS:
         raise HTTPException(
             status_code=400,
-            detail="method must be one of: deeplabv3plus, sam2, unet, maskrcnn, segformer.",
+            detail="method must be one of: sam2.",
         )
     try:
         payload = training_manager.get_status(method_key)
@@ -299,7 +275,7 @@ def stop_training(method: str = Form(...)) -> TrainingStopResponse:
     if method_key not in TRAINABLE_METHODS:
         raise HTTPException(
             status_code=400,
-            detail="method must be one of: deeplabv3plus, sam2, unet, maskrcnn, segformer.",
+            detail="method must be one of: sam2.",
         )
     try:
         payload = training_manager.stop_training(method_key)

@@ -1,19 +1,21 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const TRAINING_STATUS_POLL_MS = 2500;
+const TRAINING_STATUS_POLL_RUNNING_MS = 800;
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
-/** Row order and display names aligned with Assessment 3 comparison table. */
-const EVALUATION_TABLE_ROWS = [
-  { key: "unet", label: "U-Net" },
-  { key: "deeplabv3plus", label: "DeepLabV3" },
-  { key: "maskrcnn", label: "Mask R-CNN" },
-  { key: "segformer", label: "SegFormer" },
-  { key: "sam2", label: "SAM2 (Zero-shot)" }
-];
+/** SAM2-only deployment: single model row. */
+const EVALUATION_TABLE_ROWS = [{ key: "sam2", label: "SAM2" }];
 
 const METHOD_LABELS = Object.fromEntries(EVALUATION_TABLE_ROWS.map(({ key, label }) => [key, label]));
+
+/** Matches API `class_colors` / mask visualization (background, tree, tree group). */
+const STATIC_CLASS_LEGEND = [
+  { classId: "0", label: "Background", color: "#000000" },
+  { classId: "1", label: "Tree", color: "#00ff00" },
+  { classId: "2", label: "Tree Group", color: "#ffff00" }
+];
 
 function App() {
   const getInitialTheme = () => {
@@ -24,13 +26,13 @@ function App() {
 
   const [activeView, setActiveView] = useState("evaluation");
   const [file, setFile] = useState(null);
-  const [method, setMethod] = useState("unet");
+  const [method, setMethod] = useState("sam2");
   const [previewUrl, setPreviewUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
   const [evaluationError, setEvaluationError] = useState("");
-  const [trainingMethod, setTrainingMethod] = useState("unet");
+  const [trainingMethod, setTrainingMethod] = useState("sam2");
   const [trainingStatus, setTrainingStatus] = useState(null);
   const [trainingBusy, setTrainingBusy] = useState(false);
   const [backendApiStatus, setBackendApiStatus] = useState("checking");
@@ -38,6 +40,9 @@ function App() {
   const [uiTheme, setUiTheme] = useState(getInitialTheme);
   const [trainingResults, setTrainingResults] = useState(null);
   const [trainingResultsLoading, setTrainingResultsLoading] = useState(false);
+  const [segmentPrecheck, setSegmentPrecheck] = useState(null);
+  const [trainingLogExpanded, setTrainingLogExpanded] = useState(false);
+  const logTailRef = useRef(null);
 
   const legendItems = useMemo(() => {
     if (!result?.class_labels || !result?.class_colors) return [];
@@ -50,20 +55,41 @@ function App() {
       }));
   }, [result]);
 
+  const legendDisplayItems = legendItems.length > 0 ? legendItems : STATIC_CLASS_LEGEND;
+
+  const loadSegmentPrecheck = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/evaluation/precheck`);
+      const payload = await response.json();
+      if (response.ok && payload?.methods) {
+        setSegmentPrecheck(payload.methods);
+      } else {
+        setSegmentPrecheck(null);
+      }
+    } catch {
+      setSegmentPrecheck(null);
+    }
+  }, []);
+
   const isSelectedTrainingRunning = useMemo(() => {
     return trainingStatus?.status === "running" && trainingStatus?.method === trainingMethod;
   }, [trainingStatus, trainingMethod]);
 
+  const trainingPollMs = useMemo(() => {
+    if (activeView !== "evaluation") {
+      return TRAINING_STATUS_POLL_MS;
+    }
+    return trainingStatus?.status === "running" ? TRAINING_STATUS_POLL_RUNNING_MS : TRAINING_STATUS_POLL_MS;
+  }, [activeView, trainingStatus?.status]);
+
   const trainingTierNote = useMemo(() => {
-    const byMethod = {
-      deeplabv3plus: "Training uses the best-quality preset (longer schedule, stronger expected accuracy). Prefer a capable GPU.",
-      sam2: "Training uses the best-quality SAM2 preset (more steps, lower LR). Expect long runs and high memory use.",
-      unet: "Training uses the best-quality U-Net preset (more epochs).",
-      maskrcnn: "Training uses the best-quality Mask R-CNN preset; this path is the heaviest—GPU strongly recommended.",
-      segformer: "Training uses the best-quality SegFormer preset (more epochs)."
-    };
-    return byMethod[trainingMethod] || byMethod.unet;
-  }, [trainingMethod]);
+    return (
+      "SAM2 fine-tunes with GT box prompts (epoch loop, default LR 1e-5, optional early stopping). " +
+      "The “Best quality” label is only the selected profile name—it does not switch SAM2 hyperparameters. " +
+      "On Start Training, the API copies the resolved YAML into checkpoints_sam2 and downloads the matching Meta base .pt " +
+      "if it is missing (requires network the first time). Expect long runs and high VRAM."
+    );
+  }, []);
 
   const onFileChange = (event) => {
     const selected = event.target.files?.[0] || null;
@@ -194,6 +220,7 @@ function App() {
         throw new Error(payload.detail || "Failed to start training.");
       }
       setTrainingStatus(payload);
+      setTrainingLogExpanded(true);
       void loadTrainingStatus({ silent: true });
     } catch (err) {
       setEvaluationError(err.message || "Unexpected training-start error");
@@ -248,9 +275,22 @@ function App() {
     void loadTrainingStatus({ silent: true });
     const id = setInterval(() => {
       void loadTrainingStatus({ silent: true });
-    }, TRAINING_STATUS_POLL_MS);
+    }, trainingPollMs);
     return () => clearInterval(id);
-  }, [activeView, trainingMethod, loadTrainingStatus]);
+  }, [activeView, trainingMethod, loadTrainingStatus, trainingPollMs]);
+
+  useEffect(() => {
+    const el = logTailRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [trainingStatus?.log_tail]);
+
+  useEffect(() => {
+    if (activeView === "evaluation" && trainingStatus?.status === "running") {
+      setTrainingLogExpanded(true);
+    }
+  }, [activeView, trainingStatus?.status]);
 
   useEffect(() => {
     checkBackendHealth();
@@ -296,15 +336,27 @@ function App() {
     window.localStorage.setItem("ui_theme", uiTheme);
   }, [uiTheme]);
 
+  useEffect(() => {
+    if (activeView === "segmentation" && backendApiStatus === "online") {
+      void loadSegmentPrecheck();
+    }
+  }, [activeView, backendApiStatus, loadSegmentPrecheck]);
+
+  useEffect(() => {
+    setResult(null);
+    setError("");
+  }, [method]);
+
   return (
     <div className="container">
       <h1>Tree Canopy Segmentation</h1>
       <p className="app-lead">
         {activeView === "segmentation" ? (
           <>
-            <strong>Assessment 3 — Segmentation:</strong> select one of the five required CNN architectures, upload a test
-            image, and compare the input with the predicted overlay and class mask (background, individual trees, tree
-            groups).
+            <strong>SAM2 segmentation</strong> uses the same fine-tuned weights produced on the Evaluation page
+            (<code>checkpoints_sam2/sam2_finetuned_tree_canopy.pt</code>, or best/latest training snapshots if the export
+            is not present yet). Upload your own image to run inference; results update automatically after training
+            without restarting the server when possible.
           </>
         ) : (
           <>
@@ -326,20 +378,32 @@ function App() {
       <div className={`api-status api-status-${frontendStatus === "online" ? "online" : "checking"}`}>
         Frontend Package: {frontendStatus === "online" ? "Running" : "Reconnecting..."}
       </div>
-      <div className="theme-row">
+      {/* <div className="theme-row">
         <label htmlFor="ui-theme-select">Theme:</label>
         <select id="ui-theme-select" value={uiTheme} onChange={(e) => setUiTheme(e.target.value)}>
           <option value="blue">Blue (Default)</option>
           <option value="eco">Eco Green</option>
           <option value="dark">Dark</option>
         </select>
-      </div>
+      </div> */}
 
-      <div className="tabs">
-        <button className={activeView === "evaluation" ? "tab active" : "tab"} onClick={() => setActiveView("evaluation")} type="button">
+      <div className="tabs" role="tablist" aria-label="Main sections">
+        <button
+          className={activeView === "evaluation" ? "tab active" : "tab"}
+          onClick={() => setActiveView("evaluation")}
+          type="button"
+          role="tab"
+          aria-selected={activeView === "evaluation"}
+        >
           Evaluation
         </button>
-        <button className={activeView === "segmentation" ? "tab active" : "tab"} onClick={() => setActiveView("segmentation")} type="button">
+        <button
+          className={activeView === "segmentation" ? "tab active" : "tab"}
+          onClick={() => setActiveView("segmentation")}
+          type="button"
+          role="tab"
+          aria-selected={activeView === "segmentation"}
+        >
           Segmentation
         </button>
       </div>
@@ -351,21 +415,28 @@ function App() {
               <label className="seg-field">
                 <span className="seg-field-label">CNN architecture</span>
                 <select value={method} onChange={(event) => setMethod(event.target.value)} aria-label="CNN architecture">
-                  <option value="unet">U-Net</option>
-                  <option value="deeplabv3plus">DeepLabV3</option>
-                  <option value="maskrcnn">Mask R-CNN</option>
-                  <option value="segformer">SegFormer</option>
-                  <option value="sam2">SAM2 (Zero-shot)</option>
+                  <option value="sam2">SAM2</option>
                 </select>
               </label>
               <label className="seg-field seg-field-file">
                 <span className="seg-field-label">Test image</span>
-                <input type="file" accept="image/*" onChange={onFileChange} />
+                <input type="file" accept="image/*,.tif,.tiff" onChange={onFileChange} />
               </label>
               <button type="submit" disabled={loading} className="seg-submit-btn">
                 {loading ? "Running…" : "Run segmentation"}
               </button>
             </div>
+            {segmentPrecheck?.[method] != null ? (
+              <p
+                className={
+                  segmentPrecheck[method].ready_for_model_inference ? "seg-precheck seg-precheck-ok" : "seg-precheck seg-precheck-warn"
+                }
+              >
+                {segmentPrecheck[method].ready_for_model_inference
+                  ? `Weights ready: ${segmentPrecheck[method].checkpoint_path || "configured"}.`
+                  : `Model may use fallback: ${segmentPrecheck[method].reason || "checkpoint or dependency missing."}`}
+              </p>
+            ) : null}
           </form>
 
           {error ? <div className="error">{error}</div> : null}
@@ -403,20 +474,21 @@ function App() {
 
           <div className="card seg-legend-card">
             <h2 className="seg-legend-heading">Class legend</h2>
-            {legendItems.length > 0 ? (
-              <ul className="seg-legend-list">
-                {legendItems.map((item) => (
-                  <li className="seg-legend-item" key={item.classId}>
-                    <span className="swatch" style={{ backgroundColor: item.color }} />
-                    <span>{item.label}</span>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="seg-legend-static">
-                Background (black), individual trees (green), tree groups (yellow). Labels above update from the API after
-                a successful run.
+            <ul className="seg-legend-list">
+              {legendDisplayItems.map((item) => (
+                <li className="seg-legend-item" key={item.classId}>
+                  <span className="swatch" style={{ backgroundColor: item.color }} />
+                  <span>{item.label}</span>
+                </li>
+              ))}
+            </ul>
+            {result?.class_distribution ? (
+              <p className="seg-legend-note">
+                Pixel fractions after last run — background: {(result.class_distribution["0"] * 100).toFixed(1)}%, trees:{" "}
+                {(result.class_distribution["1"] * 100).toFixed(1)}%, groups: {(result.class_distribution["2"] * 100).toFixed(1)}%.
               </p>
+            ) : (
+              <p className="seg-legend-note">Overlay and class mask use the same colors as this legend.</p>
             )}
           </div>
 
@@ -439,11 +511,13 @@ function App() {
       ) : (
         <>
           <section className="card eval-spec-panel">
-            <h2>Model comparison</h2>
+            <h2>Model Training & Evaluation</h2>
             <p className="eval-spec-lead">
-              Assessment-style summary: five architectures in fixed order, with train, validation, and test accuracy
-              (or IoU when the training job stores it). Values are read from each method&apos;s{" "}
-              <code>output/evaluation/&lt;method&gt;/training_results.json</code> after training completes.
+              <strong>SAM2:</strong> the table shows <strong>train / validation / test mean IoU</strong> from prompted (box)
+              semantic evaluation (values 0–1, shown as %). They are written to{" "}
+              <code>output/evaluation/sam2/training_results.json</code> when a run finishes; <strong>test</strong> appears
+              only if <code>data/processed/test.txt</code> exists. Reload with <strong>Refresh accuracy table</strong> or
+              when the UI detects a completed or failed run.
             </p>
 
             <div className="eval-controls">
@@ -452,11 +526,7 @@ function App() {
                 onChange={(e) => setTrainingMethod(e.target.value)}
                 disabled={trainingBusy || trainingStatus?.status === "running"}
               >
-                <option value="unet">U-Net</option>
-                <option value="deeplabv3plus">DeepLabV3</option>
-                <option value="maskrcnn">Mask R-CNN</option>
-                <option value="segformer">SegFormer</option>
-                <option value="sam2">SAM2 (Zero-shot)</option>
+                <option value="sam2">SAM2</option>
               </select>
               <span className="training-tier-label" title="Only the best-quality training preset is available.">
                 Best quality
@@ -464,18 +534,18 @@ function App() {
               <button type="button" onClick={startTraining} disabled={trainingBusy || isSelectedTrainingRunning}>
                 {trainingBusy || isSelectedTrainingRunning ? "Start Training (Running...)" : "Start Training"}
               </button>
-              <button type="button" onClick={() => loadTrainingStatus()} disabled={trainingBusy}>
-                {trainingBusy ? "Refreshing..." : "Refresh now"}
-              </button>
               <button type="button" onClick={stopTraining} disabled={trainingBusy}>
                 Stop Training
-              </button>
-              <button type="button" onClick={loadTrainingResults} disabled={trainingResultsLoading}>
-                {trainingResultsLoading ? "Loading..." : "Refresh accuracy table"}
               </button>
             </div>
 
             <p className="profile-tip model-tip">{trainingTierNote}</p>
+
+            <div className="accuracy-table-toolbar">
+              <button type="button" onClick={loadTrainingResults} disabled={trainingResultsLoading}>
+                {trainingResultsLoading ? "Loading..." : "Refresh accuracy table"}
+              </button>
+            </div>
 
             <div className="spec-table-wrap">
               <table className="spec-results-table">
@@ -504,7 +574,8 @@ function App() {
                         </tr>
                       );
                     }
-                    const metricNote = r.metric_type === "iou" ? " (IoU)" : "";
+                    const metricNote =
+                      r.metric_type === "mean_iou" ? " (mean IoU)" : r.metric_type === "iou" ? " (IoU)" : "";
                     return (
                       <tr key={key}>
                         <th scope="row">
@@ -522,19 +593,30 @@ function App() {
             </div>
 
             <p className="eval-spec-footnote">
-              The accuracy table updates when a run first reaches completed or failed. You can still use{" "}
-              <strong>Refresh accuracy table</strong> anytime. SAM2 is listed as in the spec; after fine-tuning, the same
-              row shows metrics from the latest run.
+              The accuracy table updates when a run first reaches completed or failed. Use{" "}
+              <strong>Refresh accuracy table</strong> anytime to reload metrics from the latest training run.
             </p>
 
             {evaluationError ? <div className="error">{evaluationError}</div> : null}
 
-            <details className="card training-status-details">
+            <details
+              className="card training-status-details"
+              open={trainingLogExpanded}
+              onToggle={(e) => setTrainingLogExpanded(e.currentTarget.open)}
+            >
               <summary className="training-status-summary">Training status and logs</summary>
               <p className="training-auto-refresh-hint">
-                Status and log tail refresh automatically about every {TRAINING_STATUS_POLL_MS / 1000}s for the selected
-                architecture while this tab is open. Use Refresh now for an immediate pull.
+                Status and log tail refresh automatically about every{" "}
+                {trainingStatus?.status === "running"
+                  ? `${TRAINING_STATUS_POLL_RUNNING_MS / 1000}s while training is running`
+                  : `${TRAINING_STATUS_POLL_MS / 1000}s`}{" "}
+                on the Evaluation tab. After you start training, this panel opens so logs update in near real time.
               </p>
+              <div className="training-status-actions">
+                <button type="button" onClick={() => loadTrainingStatus()} disabled={trainingBusy}>
+                  {trainingBusy ? "Refreshing..." : "Refresh now"}
+                </button>
+              </div>
               <div className="training-status-inner">
                 {trainingStatus ? (
                   <>
@@ -556,10 +638,14 @@ function App() {
                     <p>
                       <strong>Log:</strong> {trainingStatus.log_path}
                     </p>
-                    {trainingStatus.log_tail ? <pre className="log-tail">{trainingStatus.log_tail}</pre> : null}
+                    {trainingStatus.log_tail ? (
+                      <pre ref={logTailRef} className="log-tail">
+                        {trainingStatus.log_tail}
+                      </pre>
+                    ) : null}
                   </>
                 ) : (
-                  <p className="training-status-empty">No status loaded yet. Start training or use Refresh Training Status.</p>
+                  <p className="training-status-empty">No status loaded yet. Start training or press Refresh now above.</p>
                 )}
               </div>
             </details>

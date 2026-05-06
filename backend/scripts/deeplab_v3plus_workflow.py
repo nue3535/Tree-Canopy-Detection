@@ -1,3 +1,6 @@
+"""DeepLabV3+ aligned with tree_canopy_multimodel_training_evaluation_fixed.ipynb:
+smp.DeepLabV3Plus(resnet34, imagenet), 512, batch 2, 50 epochs, AdamW 1e-4 / wd 1e-4, workers 2, DiceCELoss, multimodel aug."""
+
 from __future__ import annotations
 
 import argparse
@@ -26,21 +29,32 @@ except Exception:  # pragma: no cover - optional dependency
     def tqdm(x, **kwargs):
         return x
 
+from backend.app.data_layout import (
+    resolve_evaluation_annotations_path,
+    resolve_evaluation_image_dir,
+    resolve_train_annotations_path,
+    resolve_train_image_dir,
+)
+
 try:
     from backend.scripts.training_utils import (
-        DiceFocalSegLoss,
+        DiceCELoss,
         EarlyStopping,
         apply_augmentation,
         make_deeplab_notebook_train_transform,
         make_deeplab_notebook_val_transform,
+        make_multimodel_nb_train_transform,
+        make_multimodel_nb_val_transform,
     )
 except ImportError:
     from training_utils import (
-        DiceFocalSegLoss,
+        DiceCELoss,
         EarlyStopping,
         apply_augmentation,
         make_deeplab_notebook_train_transform,
         make_deeplab_notebook_val_transform,
+        make_multimodel_nb_train_transform,
+        make_multimodel_nb_val_transform,
     )
 
 
@@ -56,26 +70,8 @@ SCENE_LABELS = [
 
 def _resolve_image_dir(project_root: Path, split: str) -> Path:
     if split == "train":
-        candidates = [
-            project_root / "data" / "raw" / "train_images",
-            project_root / "data" / "raw" / "train_images_tif",
-            project_root / "data" / "raw" / "train_images_png",
-        ]
-    else:
-        candidates = [
-            project_root / "data" / "raw" / "evaluation_images",
-            project_root / "data" / "raw" / "evaluation_images_tif",
-            project_root / "data" / "raw" / "evaluation_images_png",
-        ]
-
-    first_existing = None
-    for path in candidates:
-        if path.exists() and path.is_dir():
-            if first_existing is None:
-                first_existing = path
-            if any(p.suffix.lower() in SUPPORTED_SUFFIXES for p in path.iterdir() if p.is_file()):
-                return path
-    return first_existing or candidates[0]
+        return resolve_train_image_dir(project_root)
+    return resolve_evaluation_image_dir(project_root)
 
 
 def _find_image_path(image_dir: Path, stem: str) -> Path | None:
@@ -119,24 +115,23 @@ class DeepLabV3PlusConfig:
     TRAIN_SPLIT_TXT: Path | None = None
     VAL_SPLIT_TXT: Path | None = None
 
-    # Defaults aligned with DeepLabV3Plus/tree_segmentation_training.ipynb (A100Config)
-    IMG_SIZE: int = 640
-    BATCH_SIZE: int = 6
-    NUM_EPOCHS: int = 100
-    LEARNING_RATE: float = 9e-5
-    NUM_WORKERS: int = 4
-    ENCODER_NAME: str = "timm-resnest50d"
-    ENCODER_DEPTH: int = 4
-    DECODER_CHANNELS: int = 128
-    WEIGHT_DECAY: float = 5e-4
-    ACCUMULATION_STEPS: int = 3
-    WARMUP_EPOCHS: int = 10
-    EARLY_STOPPING_PATIENCE: int = 30
-    AUGMENT_STYLE: str = "notebook"  # "notebook" (Albumentations + ImageNet norm) or "opencv"
+    # Defaults aligned with tree_canopy_multimodel_training_evaluation_fixed.ipynb
+    IMG_SIZE: int = 512
+    BATCH_SIZE: int = 2
+    NUM_EPOCHS: int = 50
+    LEARNING_RATE: float = 1e-4
+    NUM_WORKERS: int = 2
+    ENCODER_NAME: str = "resnet34"
+    WEIGHT_DECAY: float = 1e-4
+    ACCUMULATION_STEPS: int = 1
+    WARMUP_EPOCHS: int = 0
+    EARLY_STOPPING_PATIENCE: int = 999
+    # multimodel: Colab multimodel notebook aug | notebook: older DeepLab Colab | opencv: legacy
+    AUGMENT_STYLE: str = "multimodel"
 
     def __post_init__(self) -> None:
         if self.ANNOTATIONS_PATH is None:
-            self.ANNOTATIONS_PATH = self.PROJECT_DIR / "data" / "raw" / "annotations" / "train_annotations.json"
+            self.ANNOTATIONS_PATH = resolve_train_annotations_path(self.PROJECT_DIR)
         if self.IMAGE_DIR is None:
             self.IMAGE_DIR = _resolve_image_dir(self.PROJECT_DIR, "train")
         if self.EVAL_IMAGE_DIR is None:
@@ -162,7 +157,10 @@ class SemanticDataset(Dataset):
         self.img_size = img_size
         self.training = training
         self.augment_style = augment_style
-        if augment_style == "notebook":
+        if augment_style == "multimodel":
+            self._train_tf = make_multimodel_nb_train_transform(img_size)
+            self._val_tf = make_multimodel_nb_val_transform(img_size)
+        elif augment_style == "notebook":
             self._train_tf = make_deeplab_notebook_train_transform(img_size)
             self._val_tf = make_deeplab_notebook_val_transform(img_size)
 
@@ -177,7 +175,7 @@ class SemanticDataset(Dataset):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         mask = record["mask"].astype(np.uint8)
 
-        if self.augment_style == "notebook":
+        if self.augment_style in ("multimodel", "notebook"):
             if self.training:
                 out = self._train_tf(image=image, mask=mask)
             else:
@@ -241,17 +239,15 @@ def _load_records(config: DeepLabV3PlusConfig) -> tuple[list[dict], list[dict]]:
 
 
 def _build_model(config: DeepLabV3PlusConfig) -> torch.nn.Module:
-    kwargs = dict(
-        encoder_name=config.ENCODER_NAME,
-        encoder_weights="imagenet",
-        in_channels=3,
-        classes=3,
-        activation=None,
-        encoder_depth=config.ENCODER_DEPTH,
-        decoder_channels=config.DECODER_CHANNELS,
-    )
+    """DeepLabV3+ with ImageNet encoder (multimodel notebook: resnet34)."""
     try:
-        return smp.DeepLabV3Plus(**kwargs)
+        return smp.DeepLabV3Plus(
+            encoder_name=config.ENCODER_NAME,
+            encoder_weights="imagenet",
+            in_channels=3,
+            classes=3,
+            activation=None,
+        )
     except Exception as exc:
         print(
             f"[DeepLabV3+] WARN: could not build encoder {config.ENCODER_NAME} ({exc}); "
@@ -280,7 +276,7 @@ def _mean_iou(pred: torch.Tensor, target: torch.Tensor, num_classes: int = 3) ->
     return float(np.mean(ious))
 
 
-def get_transform(img_size: int = 640, imagenet_norm: bool = True) -> Callable[[np.ndarray], torch.Tensor]:
+def get_transform(img_size: int = 512, imagenet_norm: bool = True) -> Callable[[np.ndarray], torch.Tensor]:
     """Preprocess for DeepLab input: resize to img_size; optionally ImageNet norm (notebook / default training)."""
     mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.224]).view(3, 1, 1)
@@ -337,7 +333,7 @@ def _save_evaluation_artifacts(
     cm = np.zeros((3, 3), dtype=np.int64)
     image_ious: list[float] = []
     tp_like_ious: list[float] = []
-    transform = get_transform(config.IMG_SIZE, imagenet_norm=config.AUGMENT_STYLE == "notebook")
+    transform = get_transform(config.IMG_SIZE, imagenet_norm=config.AUGMENT_STYLE in ("notebook", "multimodel"))
 
     for idx, record in enumerate(val_records, start=1):
         image_path = record["image_path"]
@@ -441,7 +437,7 @@ def _compute_pixel_accuracy(model: torch.nn.Module, loader: DataLoader, device: 
 def _compute_test_accuracy(
     model: torch.nn.Module, config: DeepLabV3PlusConfig, device: torch.device,
 ) -> float | None:
-    eval_annot = config.PROJECT_DIR / "data" / "raw" / "annotations" / "evaluation_annotations.json"
+    eval_annot = resolve_evaluation_annotations_path(config.PROJECT_DIR)
     if not eval_annot.exists():
         return None
     try:
@@ -518,7 +514,7 @@ def train(config: DeepLabV3PlusConfig) -> None:
         lr=config.LEARNING_RATE,
         weight_decay=config.WEIGHT_DECAY,
     )
-    criterion = DiceFocalSegLoss(num_classes=3)
+    criterion = DiceCELoss(num_classes=3)
     early_stopping = EarlyStopping(patience=config.EARLY_STOPPING_PATIENCE)
 
     def _lr_lambda(ep: int) -> float:
@@ -609,7 +605,7 @@ def train(config: DeepLabV3PlusConfig) -> None:
         "final_train_loss": round(running_loss / max(1, len(train_loader)), 6),
         "epochs": config.NUM_EPOCHS,
         "timestamp": int(time.time()),
-        "config_note": "Aligned with tree_segmentation_training.ipynb (A100Config); loss = 0.5*Dice+0.5*Focal.",
+        "config_note": "Aligned with tree_canopy_multimodel_training_evaluation_fixed.ipynb: 512, batch 2, 50 epochs, AdamW 1e-4, wd 1e-4, resnet34, DiceCELoss, multimodel Albumentations.",
     }
     results_path = config.OUTPUT_DIR / "training_results.json"
     results_path.write_text(json.dumps(training_results, indent=2), encoding="utf-8")
@@ -622,10 +618,32 @@ def train(config: DeepLabV3PlusConfig) -> None:
     _save_evaluation_artifacts(model, val_records, config, device)
 
 
+def load_model_from_checkpoint_path(config: DeepLabV3PlusConfig, ckpt_path: Path) -> tuple[torch.nn.Module, torch.device, str]:
+    """Load DeepLabV3+ weights from one explicit ``.pth`` file (API / fixed deployment path)."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt_path = Path(ckpt_path)
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(f"DeepLab checkpoint not found: {ckpt_path}")
+    model = _build_model(config).to(device)
+    try:
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(ckpt_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+    state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    return model, device, str(ckpt_path)
+
+
 def load_best_model(config: DeepLabV3PlusConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = _build_model(config).to(device)
     candidates = [
+        config.SAVE_DIR / "deeplabv3plus_checkpoint.pth",
         config.SAVE_DIR / "final_model.pth",
         config.SAVE_DIR / "best_model_fold0.pth",
     ] + sorted(config.SAVE_DIR.glob("best_model_fold*.pth"))
@@ -653,7 +671,7 @@ def evaluate(config: DeepLabV3PlusConfig) -> None:
 def run_predict(config: DeepLabV3PlusConfig, num_images: int = 6) -> None:
     ensure_output_dirs(config)
     model, device, _ = load_best_model(config)
-    transform = get_transform(config.IMG_SIZE, imagenet_norm=config.AUGMENT_STYLE == "notebook")
+    transform = get_transform(config.IMG_SIZE, imagenet_norm=config.AUGMENT_STYLE in ("notebook", "multimodel"))
     image_paths = []
     for suffix in SUPPORTED_SUFFIXES:
         image_paths.extend(config.EVAL_IMAGE_DIR.glob(f"*{suffix}"))
@@ -679,22 +697,22 @@ def run_predict(config: DeepLabV3PlusConfig, num_images: int = 6) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeepLabV3+ workflow")
     parser.add_argument("action", choices=["train", "evaluate", "predict"], default="train")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=6)
-    parser.add_argument("--img-size", type=int, default=640)
-    parser.add_argument("--lr", type=float, default=9e-5)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--encoder-name", type=str, default="timm-resnest50d")
-    parser.add_argument("--accum-steps", type=int, default=3)
-    parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--warmup-epochs", type=int, default=10)
-    parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--img-size", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--encoder-name", type=str, default="resnet34")
+    parser.add_argument("--accum-steps", type=int, default=1)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--warmup-epochs", type=int, default=0)
+    parser.add_argument("--patience", type=int, default=999)
     parser.add_argument(
         "--augment-style",
         type=str,
-        choices=["notebook", "opencv"],
-        default="notebook",
-        help="notebook: Albumentations + ImageNet norm (Colab notebook). opencv: legacy resize + simple aug.",
+        choices=["multimodel", "notebook", "opencv"],
+        default="multimodel",
+        help="multimodel: Colab multimodel notebook aug. notebook: older DeepLab Colab. opencv: legacy.",
     )
     parser.add_argument("--num-images", type=int, default=6)
     return parser.parse_args()

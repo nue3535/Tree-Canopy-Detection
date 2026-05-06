@@ -1,3 +1,7 @@
+"""Mask R-CNN training aligned with tree_canopy_multimodel_training_evaluation_fixed.ipynb:
+maskrcnn_resnet50_fpn(weights=DEFAULT) + replaced ROI heads for 3 classes; 512² inputs; batch 2 / workers 2;
+AdamW lr=1e-4, weight_decay=1e-4, 50 epochs; train step skips samples with no boxes (notebook behavior)."""
+
 from __future__ import annotations
 
 import argparse
@@ -20,8 +24,17 @@ except Exception:  # pragma: no cover - optional dependency
 
 try:
     from torchvision.models.detection import maskrcnn_resnet50_fpn
+    from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+    from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 except Exception as exc:  # pragma: no cover - runtime environment dependent
     raise RuntimeError("torchvision detection module is required for Mask R-CNN training.") from exc
+
+from backend.app.data_layout import (
+    resolve_evaluation_annotations_path,
+    resolve_evaluation_image_dir,
+    resolve_train_annotations_path,
+    resolve_train_image_dir,
+)
 
 try:
     from backend.scripts.training_utils import EarlyStopping, apply_augmentation
@@ -31,21 +44,12 @@ except ImportError:
 
 SUPPORTED_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
 
+# Default training / inference spatial size (multimodel notebook).
+MASK_RCNN_INFERENCE_IMG_SIZE = 512
+
 
 def _resolve_image_dir(project_root: Path) -> Path:
-    candidates = [
-        project_root / "data" / "raw" / "train_images",
-        project_root / "data" / "raw" / "train_images_tif",
-        project_root / "data" / "raw" / "train_images_png",
-    ]
-    first_existing = None
-    for path in candidates:
-        if path.exists() and path.is_dir():
-            if first_existing is None:
-                first_existing = path
-            if any(p.suffix.lower() in SUPPORTED_SUFFIXES for p in path.iterdir() if p.is_file()):
-                return path
-    return first_existing or candidates[0]
+    return resolve_train_image_dir(project_root)
 
 
 def _find_image_path(image_dir: Path, stem: str) -> Path | None:
@@ -78,12 +82,28 @@ class TrainConfig:
     annotations_path: Path
     image_dir: Path
     save_dir: Path
-    batch_size: int = 8
-    img_size: int = 1024
+    batch_size: int = 2
+    img_size: int = 512
     max_instances_per_image: int = 80
-    epochs: int = 10
+    epochs: int = 50
     lr: float = 1e-4
-    workers: int = 0
+    weight_decay: float = 1e-4
+    workers: int = 2
+
+
+def _build_mask_rcnn(num_classes: int = 3) -> torch.nn.Module:
+    """maskrcnn_resnet50_fpn with ImageNet backbone, heads replaced for `num_classes` (incl. background)."""
+    try:
+        from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
+
+        model = maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
+    except Exception:
+        model = maskrcnn_resnet50_fpn(weights="DEFAULT")
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, 256, num_classes)
+    return model
 
 
 class DetectionDataset(Dataset):
@@ -258,22 +278,6 @@ def _predict_mask(model: torch.nn.Module, image_bgr: np.ndarray, config: TrainCo
     return pred
 
 
-def _resolve_eval_image_dir(project_root: Path) -> Path:
-    candidates = [
-        project_root / "data" / "raw" / "evaluation_images",
-        project_root / "data" / "raw" / "evaluation_images_tif",
-        project_root / "data" / "raw" / "evaluation_images_png",
-    ]
-    first_existing = None
-    for path in candidates:
-        if path.exists() and path.is_dir():
-            if first_existing is None:
-                first_existing = path
-            if any(p.suffix.lower() in SUPPORTED_SUFFIXES for p in path.iterdir() if p.is_file()):
-                return path
-    return first_existing or candidates[0]
-
-
 def _compute_maskrcnn_accuracy(
     model: torch.nn.Module, records: list[dict], config: TrainConfig, device: torch.device,
 ) -> float:
@@ -296,12 +300,12 @@ def _compute_maskrcnn_accuracy(
 def _compute_test_accuracy_maskrcnn(
     model: torch.nn.Module, config: TrainConfig, device: torch.device,
 ) -> float | None:
-    eval_annot = config.project_root / "data" / "raw" / "annotations" / "evaluation_annotations.json"
+    eval_annot = resolve_evaluation_annotations_path(config.project_root)
     if not eval_annot.exists():
         return None
     try:
         payload = json.loads(eval_annot.read_text(encoding="utf-8"))
-        eval_image_dir = _resolve_eval_image_dir(config.project_root)
+        eval_image_dir = resolve_evaluation_image_dir(config.project_root)
         records: list[dict] = []
         for img_info in payload.get("images", []):
             stem = Path(img_info.get("file_name", "")).stem
@@ -467,9 +471,9 @@ def train(config: TrainConfig) -> None:
         collate_fn=_collate_fn,
     )
 
-    model = maskrcnn_resnet50_fpn(weights=None, weights_backbone="DEFAULT", num_classes=3).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
-    early_stopping = EarlyStopping(patience=10)
+    model = _build_mask_rcnn(num_classes=3).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    early_stopping = EarlyStopping(patience=999)
 
     best_loss = float("inf")
     try:
@@ -478,9 +482,17 @@ def train(config: TrainConfig) -> None:
             epoch_losses = []
             pbar = tqdm(loader, desc=f"[Mask R-CNN][Train] epoch {epoch+1}/{config.epochs}", dynamic_ncols=True)
             for batch_idx, (images, targets) in enumerate(pbar, start=1):
-                images = [img.to(device) for img in images]
-                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-                losses = model(images, targets)
+                filtered_images: list[torch.Tensor] = []
+                filtered_targets: list[dict] = []
+                for img, tgt in zip(images, targets):
+                    boxes = tgt.get("boxes")
+                    if boxes is None or boxes.numel() == 0 or boxes.shape[0] == 0:
+                        continue
+                    filtered_images.append(img.to(device))
+                    filtered_targets.append({k: v.to(device) for k, v in tgt.items()})
+                if not filtered_images:
+                    continue
+                losses = model(filtered_images, filtered_targets)
                 total_loss = sum(loss for loss in losses.values())
                 optimizer.zero_grad()
                 total_loss.backward()
@@ -528,6 +540,7 @@ def train(config: TrainConfig) -> None:
         "best_train_loss": round(best_loss, 6),
         "epochs": config.epochs,
         "timestamp": int(time.time()),
+        "config_note": "Aligned with multimodel notebook: Mask R-CNN ResNet50-FPN (COCO-pretrained backbone), 512, batch 2, 50 epochs, AdamW 1e-4, wd 1e-4.",
     }
     (eval_root / "training_results.json").write_text(
         json.dumps(training_results, indent=2), encoding="utf-8",
@@ -544,12 +557,13 @@ def train(config: TrainConfig) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Mask R-CNN training workflow")
     parser.add_argument("action", choices=["train"], default="train")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--img-size", type=int, default=1024)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--img-size", type=int, default=512)
     parser.add_argument("--max-instances-per-image", type=int, default=80)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--workers", type=int, default=2)
     return parser.parse_args()
 
 
@@ -558,7 +572,7 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[2]
     config = TrainConfig(
         project_root=project_root,
-        annotations_path=project_root / "data" / "raw" / "annotations" / "train_annotations.json",
+        annotations_path=resolve_train_annotations_path(project_root),
         image_dir=_resolve_image_dir(project_root),
         save_dir=project_root / "checkpoints_mask_rcnn",
         batch_size=args.batch_size,
@@ -566,6 +580,7 @@ def main() -> None:
         max_instances_per_image=args.max_instances_per_image,
         epochs=args.epochs,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         workers=args.workers,
     )
     if args.action == "train":

@@ -45,9 +45,17 @@ from backend.scripts.deeplab_v3plus_workflow import (
     DeepLabV3PlusConfig,
     ensure_output_dirs,
     get_transform,
-    load_best_model,
+    load_model_from_checkpoint_path,
     predict_image,
 )
+from backend.scripts.mask_rcnn_workflow import MASK_RCNN_INFERENCE_IMG_SIZE, _build_mask_rcnn
+from backend.scripts.unet_workflow import UNET_INFERENCE_IMAGENET_NORM, UNET_INFERENCE_IMG_SIZE
+from backend.scripts.training_utils import make_multimodel_nb_val_transform
+
+# Same hub id as `segformer_workflow` / multimodel notebook (do not import that module here — it requires transformers at import time).
+SEGFORMER_PRETRAINED_ID = "nvidia/segformer-b2-finetuned-ade-512-512"
+# Must match `SegFormerDataset` val pipeline in `segformer_workflow.py` (training uses Albumentations, not HF processor).
+SEGFORMER_INFERENCE_IMG_SIZE = 512
 
 logger = logging.getLogger(__name__)
 
@@ -135,44 +143,85 @@ def _to_hydra_config_name(config_path: Path) -> str:
     return config_path.name
 
 
-def _resolve_sam2_assets(root: Path) -> tuple[Path | None, Path | None]:
-    """Resolve SAM2 config/checkpoint using project and package fallbacks."""
-    cfg_candidates = [
-        root / "checkpoints_sam2" / "sam2_hiera_s.yaml",
-        root / "sam2_hiera_s.yaml",
-        root / "configs" / "sam2_hiera_s.yaml",
-        root / "backend" / "configs" / "sam2_hiera_s.yaml",
+def _infer_project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _first_existing_sam2_yaml(project_root: Path) -> Path | None:
+    """Match `sam2_workflow` / training: project paths first, then installed `sam2` package."""
+    env_cfg = (os.environ.get("SAM2_MODEL_CFG") or os.environ.get("MODEL_CFG") or "").strip()
+    if env_cfg:
+        p = Path(env_cfg)
+        return p if p.is_file() else None
+    candidates: list[Path] = [
+        project_root / "checkpoints_sam2" / "sam2_hiera_l.yaml",
+        project_root / "sam2_hiera_l.yaml",
+        project_root / "configs" / "sam2_hiera_l.yaml",
+        project_root / "backend" / "configs" / "sam2_hiera_l.yaml",
+        project_root / "checkpoints_sam2" / "sam2_hiera_s.yaml",
+        project_root / "sam2_hiera_s.yaml",
+        project_root / "configs" / "sam2_hiera_s.yaml",
+        project_root / "backend" / "configs" / "sam2_hiera_s.yaml",
     ]
     if _sam2_pkg is not None:
-        pkg_root = Path(_sam2_pkg.__file__).resolve().parent
-        cfg_candidates.extend(
+        pkg = Path(_sam2_pkg.__file__).resolve().parent
+        candidates.extend(
             [
-                pkg_root / "sam2_hiera_s.yaml",
-                pkg_root / "configs" / "sam2" / "sam2_hiera_s.yaml",
+                pkg / "sam2_hiera_l.yaml",
+                pkg / "sam2_hiera_s.yaml",
+                pkg / "configs" / "sam2" / "sam2_hiera_l.yaml",
+                pkg / "configs" / "sam2" / "sam2_hiera_s.yaml",
             ]
         )
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
 
-    ckpt_candidates = [
-        root / "checkpoints_sam2" / "sam2_hiera_small.pt",
-        root / "sam2_hiera_small.pt",
-        root / "checkpoints" / "sam2_hiera_small.pt",
-        root / "backend" / "checkpoints" / "sam2_hiera_small.pt",
-    ]
 
-    cfg = next((p for p in cfg_candidates if p.exists()), None)
-    ckpt = next((p for p in ckpt_candidates if p.exists()), None)
+def _resolve_sam2_finetuned_ckpt_path(root: Path) -> Path | None:
+    """Fine-tuned weights for Segmentation / evaluation inference (same training export as Evaluation page).
+
+    Order: env ``SAM2_FINETUNED_CKPT``, then ``sam2_finetuned_tree_canopy.pt`` (post-training export),
+    ``sam2_training_best.pt``, ``sam2_training_latest.pt``, ``model.torch``.
+    """
+    env_ft = (os.environ.get("SAM2_FINETUNED_CKPT") or "").strip()
+    if env_ft:
+        p = Path(env_ft)
+        return p if p.is_file() else None
+    d = root / "checkpoints_sam2"
+    for name in (
+        "sam2_finetuned_tree_canopy.pt",
+        "sam2_training_best.pt",
+        "sam2_training_latest.pt",
+        "model.torch",
+    ):
+        candidate = d / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _resolve_sam2_student_assets(root: Path) -> tuple[Path | None, Path | None]:
+    """SAM2 architecture YAML + fine-tuned student weights (``build_sam2`` with ``ckpt_path=None``, then ``load_state_dict``)."""
+    cfg = _first_existing_sam2_yaml(root)
+    if cfg is None:
+        return None, None
+    ckpt = _resolve_sam2_finetuned_ckpt_path(root)
+    if ckpt is None:
+        return None, None
     return cfg, ckpt
 
 
-def _sam2_finetuned_state_path(root: Path) -> Path:
-    """Weights saved by `sam2_workflow` after training (`torch.save(model.state_dict(), ...)`)."""
-    return root / "checkpoints_sam2" / "model.torch"
-
-
-def _load_sam2_finetuned_state_dict(sam2_model: torch.nn.Module, path: Path) -> None:
-    """Load fine-tuned state on top of the SAM2 model built from the official checkpoint."""
-    blob = torch.load(str(path), map_location="cpu")
-    if isinstance(blob, dict) and "model_state_dict" in blob:
+def _load_sam2_student_state_dict(sam2_model: torch.nn.Module, path: Path) -> None:
+    """Load student fine-tuned state dict (weights produced by `sam2_workflow` / Evaluation training)."""
+    try:
+        blob = torch.load(str(path), map_location="cpu", weights_only=False)
+    except TypeError:
+        blob = torch.load(str(path), map_location="cpu")
+    if isinstance(blob, dict) and "finetuned_state_dict" in blob:
+        state = blob["finetuned_state_dict"]
+    elif isinstance(blob, dict) and "model_state_dict" in blob:
         state = blob["model_state_dict"]
     elif isinstance(blob, dict) and "state_dict" in blob:
         state = blob["state_dict"]
@@ -186,40 +235,30 @@ def _load_sam2_finetuned_state_dict(sam2_model: torch.nn.Module, path: Path) -> 
 
 
 def get_method_precheck(project_root: Path | None = None) -> dict[str, dict]:
-    root = project_root or Path(__file__).resolve().parents[2]
+    root = project_root or _infer_project_root()
 
-    deeplab_candidates = [
-        root / "checkpoints_deeplabv3plus" / "final_model.pth",
-        *sorted((root / "checkpoints_deeplabv3plus").glob("best_model_fold*.pth")),
-    ]
-    deeplab_ckpt = next((p for p in deeplab_candidates if p.exists()), None)
+    deeplab_ckpt = root / "checkpoints_deeplabv3plus" / "deeplabv3plus_checkpoint.pth"
+    deeplab_ckpt = deeplab_ckpt if deeplab_ckpt.is_file() else None
 
     sam2_dependency_ok = build_sam2 is not None and SAM2ImagePredictor is not None
-    sam2_cfg, sam2_ckpt = _resolve_sam2_assets(root)
-    sam2_assets_ok = sam2_cfg is not None and sam2_ckpt is not None
-    sam2_finetuned_path = _sam2_finetuned_state_path(root)
+    sam2_cfg, sam2_student_ckpt = _resolve_sam2_student_assets(root)
+    sam2_assets_ok = sam2_cfg is not None and sam2_student_ckpt is not None
 
-    unet_candidates = [
-        root / "checkpoints_unet" / "best_model.pth",
-        root / "checkpoints_unet" / "final_model.pth",
-        root / "checkpoints_unet" / "model.pth",
-    ]
-    unet_ckpt = next((p for p in unet_candidates if p.exists()), None)
+    unet_ckpt = root / "checkpoints_unet" / "unet_checkpoint.pth"
+    unet_ckpt = unet_ckpt if unet_ckpt.is_file() else None
 
-    maskrcnn_candidates = [
-        root / "checkpoints_mask_rcnn" / "best_model.pth",
-        root / "checkpoints_mask_rcnn" / "final_model.pth",
-        root / "checkpoints_mask_rcnn" / "model.pth",
-    ]
-    maskrcnn_ckpt = next((p for p in maskrcnn_candidates if p.exists()), None)
+    maskrcnn_ckpt = root / "checkpoints_mask_rcnn" / "maskrcnn_checkpoint.pth"
+    maskrcnn_ckpt = maskrcnn_ckpt if maskrcnn_ckpt.is_file() else None
 
+    segformer_pth = root / "checkpoints_segformer" / "segformer_checkpoint.pth"
     segformer_candidates = [
         root / "checkpoints_segformer",
         root / "models" / "segformer",
     ]
     segformer_dir = next((p for p in segformer_candidates if p.exists() and p.is_dir()), None)
     segformer_config = segformer_dir / "config.json" if segformer_dir else None
-    segformer_ready = segformer_dir is not None and segformer_config is not None and segformer_config.exists()
+    segformer_hf_ready = segformer_dir is not None and segformer_config is not None and segformer_config.exists()
+    segformer_ready = segformer_pth.is_file() or segformer_hf_ready
 
     return {
         "deeplabv3plus": {
@@ -231,11 +270,19 @@ def get_method_precheck(project_root: Path | None = None) -> dict[str, dict]:
         },
         "sam2": {
             "checkpoint_found": sam2_assets_ok,
-            "checkpoint_path": str(sam2_ckpt) if sam2_ckpt else "",
-            "finetuned_weights_path": str(sam2_finetuned_path) if sam2_finetuned_path.is_file() else "",
+            "checkpoint_path": str(sam2_student_ckpt) if sam2_student_ckpt else "",
+            "finetuned_weights_path": str(sam2_student_ckpt) if sam2_student_ckpt else "",
             "dependency_ok": sam2_dependency_ok,
             "ready_for_model_inference": sam2_dependency_ok and sam2_assets_ok,
-            "reason": "" if (sam2_dependency_ok and sam2_assets_ok) else "SAM2 dependency/config/checkpoint missing.",
+            "reason": ""
+            if (sam2_dependency_ok and sam2_assets_ok)
+            else (
+                "SAM2 needs a Hiera YAML and fine-tuned weights in checkpoints_sam2 "
+                "(sam2_finetuned_tree_canopy.pt from Evaluation training, or sam2_training_best.pt / "
+                "sam2_training_latest.pt / model.torch). Public Meta weights are not used for inference."
+                if sam2_dependency_ok
+                else "SAM2 dependency missing."
+            ),
         },
         "unet": {
             "checkpoint_found": unet_ckpt is not None,
@@ -253,7 +300,7 @@ def get_method_precheck(project_root: Path | None = None) -> dict[str, dict]:
         },
         "segformer": {
             "checkpoint_found": segformer_ready,
-            "checkpoint_path": str(segformer_dir) if segformer_dir else "",
+            "checkpoint_path": str(segformer_pth) if segformer_pth.is_file() else (str(segformer_dir) if segformer_dir else ""),
             "dependency_ok": (SegformerForSemanticSegmentation is not None and SegformerImageProcessor is not None),
             "ready_for_model_inference": (
                 SegformerForSemanticSegmentation is not None
@@ -289,18 +336,23 @@ def colorize_mask(seg_mask: np.ndarray) -> Image.Image:
 
 
 def mask_overlay(original_image: Image.Image, seg_mask: np.ndarray) -> Image.Image:
+    """Blend original with class colors (same palette as `colorize_mask` / API legend)."""
     original_arr = np.asarray(original_image, dtype=np.uint8)
     color_lut = np.array(
-        [
-            [0, 0, 0],
-            [34, 139, 34],
-            [30, 144, 255],
-        ],
+        [CLASS_COLORS_RGB[str(i)] for i in range(3)],
         dtype=np.uint8,
     )
     colored_mask = color_lut[np.clip(seg_mask.astype(np.int32), 0, len(color_lut) - 1)]
     overlay = (0.6 * original_arr + 0.4 * colored_mask).astype(np.uint8)
     return Image.fromarray(overlay)
+
+
+def excess_green_raw(rgb: np.ndarray) -> np.ndarray:
+    """Excess Green index per pixel (float32). Expects RGB uint8 HxWx3."""
+    r = rgb[..., 0].astype(np.float32)
+    g = rgb[..., 1].astype(np.float32)
+    b = rgb[..., 2].astype(np.float32)
+    return 2.0 * g - r - b
 
 
 def fallback_segment(image_bytes: bytes) -> tuple[Image.Image, np.ndarray]:
@@ -397,16 +449,22 @@ class DeepLabSegmentationService:
         project_root = Path(__file__).resolve().parents[2]
         self._config = DeepLabV3PlusConfig(PROJECT_DIR=project_root)
         ensure_output_dirs(self._config)
+        ckpt_path = project_root / "checkpoints_deeplabv3plus" / "deeplabv3plus_checkpoint.pth"
         try:
-            self._model, self._device, _ = load_best_model(self._config)
-        except FileNotFoundError as exc:
+            self._model, self._device, _ = load_model_from_checkpoint_path(self._config, ckpt_path)
+        except FileNotFoundError:
             self._use_fallback = True
             self._fallback_reason = (
-                "DeepLab checkpoint unavailable; using fallback vegetation segmentation."
+                f"DeepLab checkpoint missing at {ckpt_path}; using fallback vegetation segmentation."
+            )
+        except Exception:
+            self._use_fallback = True
+            self._fallback_reason = (
+                "DeepLab model could not be loaded from deeplabv3plus_checkpoint.pth; using fallback vegetation segmentation."
             )
         self._transform = get_transform(
             img_size=self._config.IMG_SIZE,
-            imagenet_norm=self._config.AUGMENT_STYLE == "notebook",
+            imagenet_norm=self._config.AUGMENT_STYLE in ("notebook", "multimodel"),
         )
         self._loaded = True
 
@@ -444,13 +502,77 @@ class DeepLabSegmentationService:
 
 
 class SAM2SegmentationService:
-    """SAM2 inference: official checkpoint via `build_sam2`, then `checkpoints_sam2/model.torch` if present."""
+    """SAM2 (Hiera) via `build_sam2` + `SAM2ImagePredictor` using **fine-tuned student weights** from Evaluation training.
+
+    Loads architecture from the first available Hiera YAML (same search as training) and weights via
+    `_resolve_sam2_finetuned_ckpt_path` (export ``sam2_finetuned_tree_canopy.pt``, then training snapshots).
+    **No Meta pretrained ``.pt`` is used for inference** (`build_sam2(..., ckpt_path=None)` then
+    ``load_state_dict``). If the checkpoint file on disk is replaced or updated, the model reloads on the next
+    request. Override with ``SAM2_MODEL_CFG`` and ``SAM2_FINETUNED_CKPT`` if needed.
+
+    **Inference resolution** defaults to 512 (`SAM2_IMAGE_SIZE`). This API uses a **grid of point prompts**
+    (no GT boxes), then upsamples the label map to the original image size.
+
+    **Three-class output (0=background, 1=tree, 2=tree group):** SAM2 still predicts binary masks per prompt.
+    We OR accepted masks into a foreground union, optionally open to reduce speckle, then run
+    `connectedComponentsWithStats` and assign each component class 1 vs 2 by **component area** (same
+    thresholds as other instance-style paths).     **Roof suppression (default on):** after upsampling we remove **large** roof-like blobs: low mean ExG,
+    or (optional) **reddish / R>G** with moderate ExG to catch brown roofs mislabeled as tree group. Small
+    regions are kept. **Union closing** (default 5×5) merges grid speckle before CC labeling; set
+    `SAM2_UNION_CLOSE_KERNEL=0` to disable. Set `SAM2_VEG_GATE=0` to skip ExG/roof cull. Env:
+    `SAM2_GRID_STEP`, `SAM2_MIN_MASK_SCORE`, `SAM2_MAX_MASKS`, `SAM2_OPEN_KERNEL`, `SAM2_MIN_CC_AREA`,
+    `SAM2_ROOF_CC_MIN_FRAC`, `SAM2_ROOF_MAX_MEAN_EXG`, `SAM2_ROOF_HUE_HEURISTIC`, `SAM2_ROOF_RG_MEAN_MIN`,
+    `SAM2_ROOF_HUE_MAX_EXG`, `SAM2_UNION_CLOSE_KERNEL`.
+    """
 
     def __init__(self) -> None:
         self._loaded = False
         self._predictor = None
         self._use_fallback = False
         self._fallback_reason = ""
+        self._source_ckpt_resolved: str | None = None
+        self._source_ckpt_mtime: float | None = None
+        self._last_load_fail_ckpt_mtime: float | None = None
+
+    def _reset_sam2_loader_state(self) -> None:
+        self._loaded = False
+        self._use_fallback = False
+        self._predictor = None
+        self._fallback_reason = ""
+        self._source_ckpt_resolved = None
+        self._source_ckpt_mtime = None
+
+    def _invalidate_if_checkpoint_changed(self) -> None:
+        """Reload after Evaluation writes a new export, or when a checkpoint first appears (no server restart)."""
+        project_root = Path(__file__).resolve().parents[2]
+        ckpt = _resolve_sam2_finetuned_ckpt_path(project_root)
+        if ckpt is None:
+            return
+        try:
+            resolved = str(ckpt.resolve())
+            mtime = ckpt.stat().st_mtime
+        except OSError:
+            return
+
+        if self._use_fallback:
+            if "could not load student checkpoint" in self._fallback_reason.lower():
+                if self._last_load_fail_ckpt_mtime is None or mtime > self._last_load_fail_ckpt_mtime + 1e-6:
+                    logger.info("SAM2 inference: checkpoint file updated; retrying after load error.")
+                    self._last_load_fail_ckpt_mtime = mtime
+                    self._reset_sam2_loader_state()
+                return
+            logger.info("SAM2 inference: fine-tuned weights found at %s; loading.", resolved)
+            self._reset_sam2_loader_state()
+            return
+
+        if not self._loaded or self._predictor is None:
+            return
+
+        if self._source_ckpt_resolved != resolved or (
+            self._source_ckpt_mtime is not None and mtime > self._source_ckpt_mtime + 1e-6
+        ):
+            logger.info("SAM2 inference: checkpoint updated (%s); reloading model.", resolved)
+            self._reset_sam2_loader_state()
 
     def _load(self) -> None:
         if self._loaded:
@@ -460,28 +582,46 @@ class SAM2SegmentationService:
             self._use_fallback = True
             self._fallback_reason = "SAM2 package unavailable; using fallback vegetation segmentation."
             self._loaded = True
+            self._source_ckpt_resolved = None
+            self._source_ckpt_mtime = None
+            self._last_load_fail_ckpt_mtime = None
             return
 
         project_root = Path(__file__).resolve().parents[2]
-        model_cfg, model_ckpt = _resolve_sam2_assets(project_root)
-        if model_cfg is None or model_ckpt is None:
+        model_cfg, student_ckpt = _resolve_sam2_student_assets(project_root)
+        if model_cfg is None or student_ckpt is None:
             self._use_fallback = True
-            self._fallback_reason = "SAM2 checkpoint/config unavailable; using fallback vegetation segmentation."
+            self._fallback_reason = (
+                "SAM2 needs a Hiera YAML (see search paths) and fine-tuned weights in checkpoints_sam2 "
+                "(sam2_finetuned_tree_canopy.pt from Evaluation training, or sam2_training_best.pt / "
+                "sam2_training_latest.pt / model.torch). Public pretrained SAM2 weights are not used."
+            )
             self._loaded = True
+            self._source_ckpt_resolved = None
+            self._source_ckpt_mtime = None
+            self._last_load_fail_ckpt_mtime = None
             return
 
-        sam2_model = build_sam2(_to_hydra_config_name(model_cfg), str(model_ckpt), device="cpu")
-        finetuned_path = _sam2_finetuned_state_path(project_root)
-        if finetuned_path.is_file():
+        try:
+            sam2_model = build_sam2(_to_hydra_config_name(model_cfg), None, device="cpu")
+            _load_sam2_student_state_dict(sam2_model, student_ckpt)
+            logger.info("SAM2 inference: loaded student weights from %s", student_ckpt)
+            self._source_ckpt_resolved = str(student_ckpt.resolve())
+            self._source_ckpt_mtime = student_ckpt.stat().st_mtime
+            self._last_load_fail_ckpt_mtime = None
+        except Exception as exc:
+            logger.warning("SAM2 inference: failed to load student weights (%s)", exc)
+            self._use_fallback = True
+            self._fallback_reason = f"SAM2 could not load student checkpoint: {exc}"
+            self._loaded = True
+            self._source_ckpt_resolved = None
+            self._source_ckpt_mtime = None
             try:
-                _load_sam2_finetuned_state_dict(sam2_model, finetuned_path)
-                logger.info("SAM2 inference: loaded fine-tuned weights from %s", finetuned_path)
-            except Exception as exc:
-                logger.warning(
-                    "SAM2 inference: failed to load fine-tuned %s (%s); using pretrained weights only.",
-                    finetuned_path,
-                    exc,
-                )
+                self._last_load_fail_ckpt_mtime = student_ckpt.stat().st_mtime
+            except OSError:
+                self._last_load_fail_ckpt_mtime = None
+            return
+
         self._predictor = SAM2ImagePredictor(sam2_model)
         self._loaded = True
 
@@ -493,17 +633,58 @@ class SAM2SegmentationService:
         labels = np.ones((points.shape[0],), dtype=np.int32)
         return points, labels
 
+    @staticmethod
+    def _cull_large_low_exg_components(
+        seg_mask: np.ndarray,
+        exg_full: np.ndarray,
+        rgb: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Remove *large* roof-like blobs (low ExG and/or reddish R>G); keep small CCs."""
+        fg = (seg_mask > 0).astype(np.uint8)
+        if int(fg.max()) == 0:
+            return seg_mask
+        h, w = seg_mask.shape
+        total = float(h * w)
+        min_big_frac = float(os.environ.get("SAM2_ROOF_CC_MIN_FRAC", "0.012"))
+        min_big_area = max(400, int(total * min_big_frac))
+        roof_max_mean_exg = float(os.environ.get("SAM2_ROOF_MAX_MEAN_EXG", "14"))
+        use_hue = os.environ.get("SAM2_ROOF_HUE_HEURISTIC", "1").strip().lower() not in ("0", "false", "no")
+        rg_min = float(os.environ.get("SAM2_ROOF_RG_MEAN_MIN", "6"))
+        hue_max_exg = float(os.environ.get("SAM2_ROOF_HUE_MAX_EXG", "24"))
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+        out = seg_mask.copy()
+        for i in range(1, num_labels):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area < min_big_area:
+                continue
+            region = labels == i
+            m_exg = float(exg_full[region].mean())
+            drop = m_exg < roof_max_mean_exg
+            if not drop and use_hue and rgb is not None:
+                r = rgb[..., 0].astype(np.float32)[region]
+                g = rgb[..., 1].astype(np.float32)[region]
+                if float((r - g).mean()) >= rg_min and m_exg < hue_max_exg:
+                    drop = True
+            if drop:
+                out[region] = 0
+        return out
+
     def _sam2_segment(self, image_bytes: bytes) -> tuple[Image.Image, np.ndarray]:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         rgb = np.asarray(image, dtype=np.uint8).copy()
         height, width = rgb.shape[:2]
-        points, labels = self._grid_points(width, height, step=max(32, min(width, height) // 16))
+        # Notebook: IMAGE_SIZE = 512; set_image / predict on this resolution.
+        side = max(32, int(os.environ.get("SAM2_IMAGE_SIZE", "512")))
+        rgb_small = cv2.resize(rgb, (side, side), interpolation=cv2.INTER_LINEAR)
+        # Wider step → fewer prompts → less speckle (dense grid + area heuristic looks like noise).
+        grid_step = max(24, int(os.environ.get("SAM2_GRID_STEP", "48")))
+        points, labels = self._grid_points(side, side, step=min(grid_step, side // 2))
 
         if points.shape[0] == 0:
             seg_mask = np.zeros((height, width), dtype=np.uint8)
             return image, seg_mask
 
-        self._predictor.set_image(rgb)
+        self._predictor.set_image(rgb_small)
         chunk_size = 128
         all_masks = []
         all_scores = []
@@ -545,40 +726,75 @@ class SAM2SegmentationService:
 
         masks = np.concatenate(all_masks, axis=0)
         scores = np.concatenate(all_scores, axis=0)
-        order = np.argsort(scores)[::-1][: min(len(scores), 200)]
+        max_masks = max(1, int(os.environ.get("SAM2_MAX_MASKS", "220")))
+        order = np.argsort(scores)[::-1][: min(len(scores), max_masks)]
         masks = masks[order]
         scores = scores[order]
 
-        min_mask_score = float(os.environ.get("SAM2_MIN_MASK_SCORE", "0.3"))
-
-        seg_mask = np.zeros((height, width), dtype=np.uint8)
-        occupancy = np.zeros((height, width), dtype=bool)
-        total_pixels = height * width
+        min_mask_score = float(os.environ.get("SAM2_MIN_MASK_SCORE", "0.22"))
+        min_mask_pixels = max(30, int(os.environ.get("SAM2_MIN_MASK_PIXELS", "50")))
+        total_pixels = side * side
         group_area_threshold = max(200, int(total_pixels * 0.01))
+        min_cc_area = max(25, int(os.environ.get("SAM2_MIN_CC_AREA", "50")))
+        veg_gate = os.environ.get("SAM2_VEG_GATE", "1").strip().lower() not in ("0", "false", "no")
+        mask_veg_filter = os.environ.get("SAM2_MASK_VEG_FILTER", "0").strip().lower() in ("1", "true", "yes")
+        exg_small = excess_green_raw(rgb_small) if (veg_gate and mask_veg_filter) else None
+        mask_pixel_exg = float(os.environ.get("SAM2_MASK_PIXEL_EXG", "10"))
+        mask_min_veg_frac = float(os.environ.get("SAM2_MASK_MIN_VEG_FRAC", "0.12"))
+
+        union = np.zeros((side, side), dtype=np.uint8)
         for mask, sc in zip(masks, scores):
             if float(sc) < min_mask_score:
                 continue
-            if int(mask.sum()) < 50:
+            if int(mask.sum()) < min_mask_pixels:
                 continue
-            overlap = np.logical_and(mask, occupancy).sum()
-            if overlap > 0 and overlap / float(mask.sum()) > 0.15:
-                continue
-            mask = np.logical_and(mask, np.logical_not(occupancy))
-            if int(mask.sum()) < 50:
-                continue
-            class_id = 2 if int(mask.sum()) >= group_area_threshold else 1
-            seg_mask[mask] = class_id
-            occupancy = np.logical_or(occupancy, mask)
+            if exg_small is not None:
+                exg_in = exg_small[mask]
+                veg_frac = float((exg_in >= mask_pixel_exg).mean())
+                if veg_frac < mask_min_veg_frac:
+                    continue
+            union = np.logical_or(union, mask).astype(np.uint8)
+
+        close_u = int(os.environ.get("SAM2_UNION_CLOSE_KERNEL", "5"))
+        if close_u >= 3 and close_u % 2 == 1 and int(union.max()) > 0:
+            kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_u, close_u))
+            union = cv2.morphologyEx(union, cv2.MORPH_CLOSE, kc)
+
+        open_k = int(os.environ.get("SAM2_OPEN_KERNEL", "0"))
+        if open_k >= 3 and open_k % 2 == 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
+            union = cv2.morphologyEx(union, cv2.MORPH_OPEN, kernel)
+
+        seg_small = np.zeros((side, side), dtype=np.uint8)
+        if int(union.max()) > 0:
+            num_labels, cc_labels, stats, _ = cv2.connectedComponentsWithStats(union, connectivity=8)
+            for i in range(1, num_labels):
+                area = int(stats[i, cv2.CC_STAT_AREA])
+                if area < min_cc_area:
+                    continue
+                region = cc_labels == i
+                seg_small[region] = 2 if area >= group_area_threshold else 1
+
+        seg_mask = cv2.resize(seg_small, (width, height), interpolation=cv2.INTER_NEAREST)
+        if veg_gate:
+            exg_full = excess_green_raw(rgb)
+            seg_mask = self._cull_large_low_exg_components(seg_mask, exg_full, rgb)
+            if os.environ.get("SAM2_FG_PIXEL_STRIP", "0").strip().lower() in ("1", "true", "yes"):
+                fg_min_exg = float(os.environ.get("SAM2_FG_MIN_EXG", "5"))
+                strip = (seg_mask > 0) & (exg_full < fg_min_exg)
+                seg_mask = seg_mask.copy()
+                seg_mask[strip] = 0
         return image, seg_mask
 
     def _predict_components(self, image_bytes: bytes, filename: str) -> tuple[Image.Image, np.ndarray, int, str, str]:
+        self._invalidate_if_checkpoint_changed()
         self._load()
         if self._use_fallback:
             original_image, seg_mask = fallback_segment(image_bytes)
             return original_image, seg_mask, 2, "sam2_fallback", self._fallback_reason
 
         original_image, seg_mask = self._sam2_segment(image_bytes)
-        return original_image, seg_mask, 2, "sam2_model", ""
+        return original_image, seg_mask, 2, "sam2_student_checkpoint", ""
 
     def segment_bytes(self, image_bytes: bytes, filename: str, strict_conservation_mode: bool = False) -> dict:
         original_image, seg_mask, scene_class, inference_mode, fallback_reason = self._predict_components(
@@ -603,7 +819,7 @@ class UNetSegmentationService:
         self._model = None
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._transform = None
-        self._img_size = 640
+        self._img_size = UNET_INFERENCE_IMG_SIZE
         self._use_fallback = False
         self._fallback_reason = ""
 
@@ -611,24 +827,18 @@ class UNetSegmentationService:
         if self._loaded:
             return
         project_root = Path(__file__).resolve().parents[2]
-        config = DeepLabV3PlusConfig(PROJECT_DIR=project_root)
-        self._img_size = int(config.IMG_SIZE)
-        self._transform = get_transform(img_size=self._img_size, imagenet_norm=False)
+        self._img_size = UNET_INFERENCE_IMG_SIZE
+        self._transform = get_transform(img_size=self._img_size, imagenet_norm=UNET_INFERENCE_IMAGENET_NORM)
         if smp is None:
             self._use_fallback = True
             self._fallback_reason = "U-Net dependencies unavailable; using fallback vegetation segmentation."
             self._loaded = True
             return
 
-        checkpoints = [
-            project_root / "checkpoints_unet" / "best_model.pth",
-            project_root / "checkpoints_unet" / "final_model.pth",
-            project_root / "checkpoints_unet" / "model.pth",
-        ]
-        ckpt_path = next((p for p in checkpoints if p.exists()), None)
-        if ckpt_path is None:
+        ckpt_path = project_root / "checkpoints_unet" / "unet_checkpoint.pth"
+        if not ckpt_path.is_file():
             self._use_fallback = True
-            self._fallback_reason = "U-Net checkpoint unavailable; using fallback vegetation segmentation."
+            self._fallback_reason = f"U-Net checkpoint missing at {ckpt_path}; using fallback vegetation segmentation."
             self._loaded = True
             return
 
@@ -640,20 +850,24 @@ class UNetSegmentationService:
                 classes=3,
                 activation=None,
             )
-            checkpoint = torch.load(ckpt_path, map_location=self._device)
+            try:
+                checkpoint = torch.load(ckpt_path, map_location=self._device, weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(ckpt_path, map_location=self._device)
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 state_dict = checkpoint["model_state_dict"]
             elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
                 state_dict = checkpoint["state_dict"]
             else:
                 state_dict = checkpoint
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
             model.load_state_dict(state_dict, strict=False)
             model.eval()
             model.to(self._device)
             self._model = model
         except Exception:
             self._use_fallback = True
-            self._fallback_reason = "U-Net model could not be loaded; using fallback vegetation segmentation."
+            self._fallback_reason = "U-Net model could not be loaded from unet_checkpoint.pth; using fallback vegetation segmentation."
         self._loaded = True
 
     def _predict_components(self, image_bytes: bytes, filename: str) -> tuple[Image.Image, np.ndarray, int, str, str]:
@@ -713,34 +927,37 @@ class MaskRCNNSegmentationService:
             self._loaded = True
             return
 
-        checkpoints = [
-            project_root / "checkpoints_mask_rcnn" / "best_model.pth",
-            project_root / "checkpoints_mask_rcnn" / "final_model.pth",
-            project_root / "checkpoints_mask_rcnn" / "model.pth",
-        ]
-        ckpt_path = next((p for p in checkpoints if p.exists()), None)
-        if ckpt_path is None:
+        ckpt_path = project_root / "checkpoints_mask_rcnn" / "maskrcnn_checkpoint.pth"
+        if not ckpt_path.is_file():
             self._use_fallback = True
-            self._fallback_reason = "Mask R-CNN checkpoint unavailable; using fallback vegetation segmentation."
+            self._fallback_reason = (
+                f"Mask R-CNN checkpoint missing at {ckpt_path}; using fallback vegetation segmentation."
+            )
             self._loaded = True
             return
 
         try:
-            model = maskrcnn_resnet50_fpn(weights=None, weights_backbone=None, num_classes=3)
-            checkpoint = torch.load(ckpt_path, map_location=self._device)
+            model = _build_mask_rcnn(num_classes=3)
+            try:
+                checkpoint = torch.load(ckpt_path, map_location=self._device, weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(ckpt_path, map_location=self._device)
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 state_dict = checkpoint["model_state_dict"]
             elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
                 state_dict = checkpoint["state_dict"]
             else:
                 state_dict = checkpoint
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
             model.load_state_dict(state_dict, strict=False)
             model.eval()
             model.to(self._device)
             self._model = model
         except Exception:
             self._use_fallback = True
-            self._fallback_reason = "Mask R-CNN model could not be loaded; using fallback vegetation segmentation."
+            self._fallback_reason = (
+                "Mask R-CNN model could not be loaded from maskrcnn_checkpoint.pth; using fallback vegetation segmentation."
+            )
         self._loaded = True
 
     def _predict_components(self, image_bytes: bytes, filename: str) -> tuple[Image.Image, np.ndarray, int, str, str]:
@@ -751,12 +968,14 @@ class MaskRCNNSegmentationService:
 
         original_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         rgb = np.asarray(original_image, dtype=np.uint8).copy()
-        image_tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+        h, w = rgb.shape[:2]
+        side = MASK_RCNN_INFERENCE_IMG_SIZE
+        rgb_small = cv2.resize(rgb, (side, side), interpolation=cv2.INTER_LINEAR)
+        image_tensor = torch.from_numpy(rgb_small).permute(2, 0, 1).float() / 255.0
         image_tensor = image_tensor.to(self._device)
         with torch.no_grad():
             output = self._model([image_tensor])[0]
 
-        h, w = rgb.shape[:2]
         seg_mask = np.zeros((h, w), dtype=np.uint8)
         occupancy = np.zeros((h, w), dtype=bool)
         total_pixels = h * w
@@ -764,7 +983,7 @@ class MaskRCNNSegmentationService:
 
         scores = output.get("scores", torch.empty((0,), device=self._device)).detach().cpu().numpy()
         labels = output.get("labels", torch.empty((0,), device=self._device)).detach().cpu().numpy()
-        masks = output.get("masks", torch.empty((0, 1, h, w), device=self._device)).detach().cpu().numpy()
+        masks = output.get("masks", torch.empty((0, 1, side, side), device=self._device)).detach().cpu().numpy()
         order = np.argsort(scores)[::-1]
         for idx in order:
             score = float(scores[idx])
@@ -773,7 +992,10 @@ class MaskRCNNSegmentationService:
             label = int(labels[idx])
             if label not in (1, 2):
                 continue
-            instance_mask = masks[idx, 0] > 0.5
+            instance_small = masks[idx, 0] > 0.5
+            instance_mask = cv2.resize(
+                instance_small.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
             if instance_mask.sum() < 50:
                 continue
             overlap = np.logical_and(instance_mask, occupancy).sum()
@@ -809,6 +1031,7 @@ class SegFormerSegmentationService:
         self._loaded = False
         self._model = None
         self._processor = None
+        self._pixel_transform = None  # set when using .pth + same preproc as training (`get_transform`)
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._use_fallback = False
         self._fallback_reason = ""
@@ -823,23 +1046,48 @@ class SegFormerSegmentationService:
             self._loaded = True
             return
 
-        candidates = [
+        weights_pth = project_root / "checkpoints_segformer" / "segformer_checkpoint.pth"
+        hf_dirs = [
             project_root / "checkpoints_segformer",
             project_root / "models" / "segformer",
         ]
-        ckpt_dir = next((p for p in candidates if p.exists() and p.is_dir()), None)
-        if ckpt_dir is None:
+        ckpt_dir = next((p for p in hf_dirs if p.exists() and p.is_dir() and (p / "config.json").exists()), None)
+
+        if not weights_pth.is_file() and ckpt_dir is None:
             self._use_fallback = True
             self._fallback_reason = "SegFormer checkpoint unavailable; using fallback vegetation segmentation."
             self._loaded = True
             return
 
         try:
-            self._processor = SegformerImageProcessor.from_pretrained(str(ckpt_dir), local_files_only=True)
-            self._model = SegformerForSemanticSegmentation.from_pretrained(str(ckpt_dir), local_files_only=True)
+            if weights_pth.is_file():
+                self._processor = None
+                self._pixel_transform = make_multimodel_nb_val_transform(SEGFORMER_INFERENCE_IMG_SIZE)
+                self._model = SegformerForSemanticSegmentation.from_pretrained(
+                    SEGFORMER_PRETRAINED_ID,
+                    num_labels=3,
+                    ignore_mismatched_sizes=True,
+                )
+                try:
+                    blob = torch.load(weights_pth, map_location=self._device, weights_only=False)
+                except TypeError:
+                    blob = torch.load(weights_pth, map_location=self._device)
+                if isinstance(blob, dict) and "model_state_dict" in blob:
+                    state_dict = blob["model_state_dict"]
+                elif isinstance(blob, dict) and "state_dict" in blob:
+                    state_dict = blob["state_dict"]
+                else:
+                    state_dict = blob
+                state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+                self._model.load_state_dict(state_dict, strict=False)
+            else:
+                self._pixel_transform = None
+                self._processor = SegformerImageProcessor.from_pretrained(str(ckpt_dir), local_files_only=True)
+                self._model = SegformerForSemanticSegmentation.from_pretrained(str(ckpt_dir), local_files_only=True)
             self._model.eval()
             self._model.to(self._device)
-        except Exception:
+        except Exception as exc:
+            logger.warning("SegFormer load failed: %s", exc)
             self._use_fallback = True
             self._fallback_reason = "SegFormer model could not be loaded; using fallback vegetation segmentation."
         self._loaded = True
@@ -851,11 +1099,15 @@ class SegFormerSegmentationService:
             return original_image, seg_mask, 2, "segformer_fallback", self._fallback_reason
 
         original_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        inputs = self._processor(images=original_image, return_tensors="pt")
-        pixel_values = inputs["pixel_values"].to(self._device).float()
-        # Some exported processors may emit uint8 tensors; ensure model-compatible scale.
-        if torch.max(pixel_values).item() > 1.5:
-            pixel_values = pixel_values / 255.0
+        if self._pixel_transform is not None:
+            rgb = np.asarray(original_image, dtype=np.uint8)
+            aug = self._pixel_transform(image=rgb)
+            pixel_values = aug["image"].unsqueeze(0).to(self._device).float()
+        else:
+            inputs = self._processor(images=original_image, return_tensors="pt")
+            pixel_values = inputs["pixel_values"].to(self._device).float()
+            if torch.max(pixel_values).item() > 1.5:
+                pixel_values = pixel_values / 255.0
         with torch.no_grad():
             outputs = self._model(pixel_values=pixel_values)
             logits = outputs.logits

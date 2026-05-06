@@ -127,6 +127,35 @@ form.card.seg-control-card {
   flex-shrink: 0;
 }
 
+.seg-precheck {
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.seg-precheck-ok {
+  color: #0f6b3a;
+}
+
+:root[data-theme="dark"] .seg-precheck-ok {
+  color: #7dffc2;
+}
+
+.seg-precheck-warn {
+  color: #92400e;
+}
+
+:root[data-theme="dark"] .seg-precheck-warn {
+  color: #fcd34d;
+}
+
+.seg-legend-note {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
 .seg-results-grid {
   display: grid;
   gap: 16px;
@@ -522,6 +551,22 @@ h2 .refresh-btn {
   border: 1px solid var(--border-soft);
   border-radius: 4px;
   padding: 1px 5px;
+}
+
+.accuracy-table-toolbar {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 12px 0 0;
+}
+
+.training-status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 0 14px;
 }
 
 .spec-table-wrap {

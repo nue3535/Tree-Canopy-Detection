@@ -22,7 +22,7 @@ class JobState:
 
 
 class TrainingManager:
-    """Single training tier: best-quality presets only (Fast / Balanced removed)."""
+    """Launches workflow scripts; hyperparameters match the multimodel Colab notebook defaults in code."""
     SUPPORTED_PROFILES = {"best-quality"}
 
     def __init__(self) -> None:
@@ -41,18 +41,8 @@ class TrainingManager:
         return None
 
     def _profile_args_for_method(self, method: str, profile: str) -> list[str]:
-        """Best-quality CLI overrides per workflow (SAM2 uses env vars only)."""
-        if method == "sam2":
-            return []
-        if profile != "best-quality":
-            return []
-        best: dict[str, list[str]] = {
-            "deeplabv3plus": ["--epochs", "120", "--lr", "6e-5", "--patience", "40"],
-            "unet": ["--epochs", "50", "--lr", "8e-5"],
-            "maskrcnn": ["--epochs", "16", "--max-instances-per-image", "100", "--lr", "8e-5"],
-            "segformer": ["--epochs", "35", "--lr", "8e-5"],
-        }
-        return best.get(method, [])
+        """Workflow scripts embed multimodel-notebook defaults; do not override from the API."""
+        return []
 
     def _command_for_method(self, method: str, profile: str) -> list[str]:
         if method == "deeplabv3plus":
@@ -103,37 +93,28 @@ class TrainingManager:
         if method != "sam2":
             return env
 
-        # SAM2: best-quality tier only (env overrides module defaults).
-        env["SAM2_MIN_MASK_SCORE"] = "0.3"
-        env["SAM2_STEPS"] = "6000"
-        env["SAM2_SAVE_EVERY"] = "250"
-        env["SAM2_BATCH_SIZE"] = "6"
-        env["SAM2_LR"] = "8e-5"
+        # SAM2: optional env overrides; defaults match tree_canopy_multimodel notebook spirit (batch 2, lr 1e-4).
+        env.setdefault("SAM2_MIN_MASK_SCORE", "0.3")
+        env.setdefault("SAM2_BATCH_SIZE", "2")
+        env.setdefault("SAM2_LR", "1e-4")
 
         cfg_env = env.get("SAM2_MODEL_CFG") or env.get("MODEL_CFG")
-        ckpt_env = env.get("SAM2_CHECKPOINT")
-        if cfg_env and ckpt_env:
+        if cfg_env:
             return env
 
         cfg_candidates = [
+            self.project_root / "checkpoints_sam2" / "sam2_hiera_l.yaml",
+            self.project_root / "sam2_hiera_l.yaml",
+            self.project_root / "configs" / "sam2_hiera_l.yaml",
+            self.project_root / "backend" / "configs" / "sam2_hiera_l.yaml",
             self.project_root / "checkpoints_sam2" / "sam2_hiera_s.yaml",
             self.project_root / "sam2_hiera_s.yaml",
             self.project_root / "configs" / "sam2_hiera_s.yaml",
             self.project_root / "backend" / "configs" / "sam2_hiera_s.yaml",
         ]
-        ckpt_candidates = [
-            self.project_root / "checkpoints_sam2" / "sam2_hiera_small.pt",
-            self.project_root / "sam2_hiera_small.pt",
-            self.project_root / "checkpoints" / "sam2_hiera_small.pt",
-            self.project_root / "backend" / "checkpoints" / "sam2_hiera_small.pt",
-        ]
         resolved_cfg = self._first_existing_file(cfg_candidates)
-        resolved_ckpt = self._first_existing_file(ckpt_candidates)
-
-        if not cfg_env and resolved_cfg:
+        if resolved_cfg:
             env["SAM2_MODEL_CFG"] = resolved_cfg
-        if not ckpt_env and resolved_ckpt:
-            env["SAM2_CHECKPOINT"] = resolved_ckpt
 
         return env
 
@@ -149,6 +130,14 @@ class TrainingManager:
 
         command = self._command_for_method(method, profile)
         runtime_env = self._runtime_env_for_method(method, profile)
+        if method == "sam2":
+            from backend.app.sam2_assets import prepare_sam2_checkpoints_dir
+
+            yaml_path, pt_path = prepare_sam2_checkpoints_dir(self.project_root, runtime_env)
+            runtime_env = dict(runtime_env)
+            runtime_env["SAM2_MODEL_CFG"] = str(yaml_path)
+            runtime_env["SAM2_CHECKPOINT"] = str(pt_path)
+
         ts = int(time.time())
         log_path = self.logs_dir / f"{method}_{ts}.log"
         log_file = open(log_path, "w", encoding="utf-8", buffering=1)
@@ -210,7 +199,7 @@ class TrainingManager:
         if state.log_path.exists():
             with open(state.log_path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
-                log_tail = "".join(lines[-40:])
+                log_tail = "".join(lines[-120:])
 
         return {
             "method": state.method,
