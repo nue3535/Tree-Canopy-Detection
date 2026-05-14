@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as UTIF from "utif";
 
 const TRAINING_STATUS_POLL_MS = 2500;
 const TRAINING_STATUS_POLL_RUNNING_MS = 800;
@@ -9,6 +10,11 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 const EVALUATION_TABLE_ROWS = [{ key: "sam2", label: "SAM2" }];
 
 const METHOD_LABELS = Object.fromEntries(EVALUATION_TABLE_ROWS.map(({ key, label }) => [key, label]));
+const SEGMENT_SENSITIVITY_OPTIONS = [
+  { key: "conservative", label: "Conservative" },
+  { key: "balanced", label: "Balanced" },
+  { key: "recall", label: "Recall" }
+];
 
 /** Matches API `class_colors` / mask visualization (background, tree, tree group). */
 const STATIC_CLASS_LEGEND = [
@@ -16,6 +22,39 @@ const STATIC_CLASS_LEGEND = [
   { classId: "1", label: "Tree", color: "#00ff00" },
   { classId: "2", label: "Tree Group", color: "#ffff00" }
 ];
+
+const TIFF_EXTENSIONS = [".tif", ".tiff"];
+
+function isTiffFile(file) {
+  const name = (file?.name || "").toLowerCase();
+  const type = (file?.type || "").toLowerCase();
+  return TIFF_EXTENSIONS.some((ext) => name.endsWith(ext)) || type.includes("tif") || type.includes("tiff");
+}
+
+async function tiffFileToPngDataUrl(file) {
+  const buffer = await file.arrayBuffer();
+  const ifds = UTIF.decode(buffer);
+  if (!ifds.length) {
+    throw new Error("No TIFF image frames found.");
+  }
+  UTIF.decodeImage(buffer, ifds[0]);
+  const width = Number(ifds[0].width || 0);
+  const height = Number(ifds[0].height || 0);
+  if (width <= 0 || height <= 0) {
+    throw new Error("Invalid TIFF dimensions.");
+  }
+  const rgba = UTIF.toRGBA8(ifds[0]);
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Could not create canvas for TIFF preview.");
+  }
+  const imageData = new ImageData(new Uint8ClampedArray(rgba), width, height);
+  ctx.putImageData(imageData, 0, 0);
+  return canvas.toDataURL("image/png");
+}
 
 function App() {
   const getInitialTheme = () => {
@@ -27,6 +66,7 @@ function App() {
   const [activeView, setActiveView] = useState("evaluation");
   const [file, setFile] = useState(null);
   const [method, setMethod] = useState("sam2");
+  const [segmentSensitivity, setSegmentSensitivity] = useState("balanced");
   const [previewUrl, setPreviewUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -43,6 +83,7 @@ function App() {
   const [segmentPrecheck, setSegmentPrecheck] = useState(null);
   const [trainingLogExpanded, setTrainingLogExpanded] = useState(false);
   const logTailRef = useRef(null);
+  const previewObjectUrlRef = useRef("");
 
   const legendItems = useMemo(() => {
     if (!result?.class_labels || !result?.class_colors) return [];
@@ -91,17 +132,44 @@ function App() {
     );
   }, []);
 
-  const onFileChange = (event) => {
+  const onFileChange = async (event) => {
     const selected = event.target.files?.[0] || null;
     setFile(selected);
     setResult(null);
     setError("");
+    if (previewObjectUrlRef.current) {
+      URL.revokeObjectURL(previewObjectUrlRef.current);
+      previewObjectUrlRef.current = "";
+    }
     if (selected) {
-      setPreviewUrl(URL.createObjectURL(selected));
+      try {
+        if (isTiffFile(selected)) {
+          const dataUrl = await tiffFileToPngDataUrl(selected);
+          setPreviewUrl(dataUrl);
+        } else {
+          const objectUrl = URL.createObjectURL(selected);
+          previewObjectUrlRef.current = objectUrl;
+          setPreviewUrl(objectUrl);
+        }
+      } catch {
+        const objectUrl = URL.createObjectURL(selected);
+        previewObjectUrlRef.current = objectUrl;
+        setPreviewUrl(objectUrl);
+        setError("Could not render local TIFF preview in browser, but segmentation upload still works.");
+      }
     } else {
       setPreviewUrl("");
     }
   };
+
+  useEffect(() => {
+    return () => {
+      if (previewObjectUrlRef.current) {
+        URL.revokeObjectURL(previewObjectUrlRef.current);
+        previewObjectUrlRef.current = "";
+      }
+    };
+  }, []);
 
   const submit = async (event) => {
     event.preventDefault();
@@ -118,6 +186,7 @@ function App() {
       formData.append("file", file);
       formData.append("method", method);
       formData.append("strict_conservation_mode", "false");
+      formData.append("segment_sensitivity", segmentSensitivity);
       const response = await fetch(`${API_BASE}/api/segment`, {
         method: "POST",
         body: formData
@@ -418,6 +487,20 @@ function App() {
                   <option value="sam2">SAM2</option>
                 </select>
               </label>
+              <label className="seg-field">
+                <span className="seg-field-label">Sensitivity</span>
+                <select
+                  value={segmentSensitivity}
+                  onChange={(event) => setSegmentSensitivity(event.target.value)}
+                  aria-label="Segmentation sensitivity"
+                >
+                  {SEGMENT_SENSITIVITY_OPTIONS.map((opt) => (
+                    <option key={opt.key} value={opt.key}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <label className="seg-field seg-field-file">
                 <span className="seg-field-label">Test image</span>
                 <input type="file" accept="image/*,.tif,.tiff" onChange={onFileChange} />
@@ -445,6 +528,7 @@ function App() {
             <div className="card seg-result-card">
               <h2 className="seg-result-title">Input</h2>
               {previewUrl ? <img src={previewUrl} alt="Input preview" className="seg-result-img" /> : <p className="seg-placeholder">Choose an image to preview.</p>}
+              <p className="seg-legend-note">TIFF preview decoded locally in your browser.</p>
             </div>
             <div className="card seg-result-card">
               <h2 className="seg-result-title">Overlay</h2>

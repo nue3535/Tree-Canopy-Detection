@@ -114,6 +114,7 @@ async def segment_image(
     file: UploadFile = File(...),
     method: str = Form("sam2"),
     strict_conservation_mode: bool = Form(False),
+    segment_sensitivity: str = Form("balanced"),
 ) -> SegmentResponse:
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image uploads are supported.")
@@ -130,11 +131,19 @@ async def segment_image(
                 status_code=400,
                 detail="Invalid method. Only sam2 is enabled.",
             )
-        result = selected_service.segment_bytes(
-            payload,
-            file.filename or "upload.png",
-            strict_conservation_mode=strict_conservation_mode,
-        )
+        if method_key == "sam2":
+            result = selected_service.segment_bytes(
+                payload,
+                file.filename or "upload.png",
+                strict_conservation_mode=strict_conservation_mode,
+                segment_sensitivity=segment_sensitivity,
+            )
+        else:
+            result = selected_service.segment_bytes(
+                payload,
+                file.filename or "upload.png",
+                strict_conservation_mode=strict_conservation_mode,
+            )
         result["method"] = method_key
         return SegmentResponse(**result)
     except HTTPException:

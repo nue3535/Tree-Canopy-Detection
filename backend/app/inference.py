@@ -502,6 +502,53 @@ class DeepLabSegmentationService:
 
 
 class SAM2SegmentationService:
+    @staticmethod
+    def _resolve_sensitivity(segment_sensitivity: str | None) -> str:
+        s = (segment_sensitivity or "balanced").strip().lower()
+        if s in {"conservative", "balanced", "recall"}:
+            return s
+        return "balanced"
+
+    @staticmethod
+    def _thresholds_for_sensitivity(segment_sensitivity: str | None) -> dict[str, float | int]:
+        """Mode-specific defaults; env vars can still override each value."""
+        mode = SAM2SegmentationService._resolve_sensitivity(segment_sensitivity)
+        if mode == "conservative":
+            return {
+                "grid_step": 64,
+                "min_mask_score": 0.35,
+                "min_mask_pixels": 120,
+                "min_cc_area": 120,
+                "group_area_frac": 0.03,
+                "mask_pixel_exg": 14.0,
+                "mask_min_veg_frac": 0.20,
+                "close_kernel": 3,
+                "max_component_frac": 0.18,
+            }
+        if mode == "recall":
+            return {
+                "grid_step": 48,
+                "min_mask_score": 0.24,
+                "min_mask_pixels": 50,
+                "min_cc_area": 50,
+                "group_area_frac": 0.012,
+                "mask_pixel_exg": 9.0,
+                "mask_min_veg_frac": 0.10,
+                "close_kernel": 5,
+                "max_component_frac": 0.35,
+            }
+        return {
+            "grid_step": 56,
+            "min_mask_score": 0.30,
+            "min_mask_pixels": 80,
+            "min_cc_area": 80,
+            "group_area_frac": 0.02,
+            "mask_pixel_exg": 12.0,
+            "mask_min_veg_frac": 0.15,
+            "close_kernel": 3,
+            "max_component_frac": 0.25,
+        }
+
     """SAM2 (Hiera) via `build_sam2` + `SAM2ImagePredictor` using **fine-tuned student weights** from Evaluation training.
 
     Loads architecture from the first available Hiera YAML (same search as training) and weights via
@@ -669,15 +716,16 @@ class SAM2SegmentationService:
                 out[region] = 0
         return out
 
-    def _sam2_segment(self, image_bytes: bytes) -> tuple[Image.Image, np.ndarray]:
+    def _sam2_segment(self, image_bytes: bytes, segment_sensitivity: str = "balanced") -> tuple[Image.Image, np.ndarray]:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         rgb = np.asarray(image, dtype=np.uint8).copy()
         height, width = rgb.shape[:2]
+        thresholds = self._thresholds_for_sensitivity(segment_sensitivity)
         # Notebook: IMAGE_SIZE = 512; set_image / predict on this resolution.
         side = max(32, int(os.environ.get("SAM2_IMAGE_SIZE", "512")))
         rgb_small = cv2.resize(rgb, (side, side), interpolation=cv2.INTER_LINEAR)
-        # Wider step → fewer prompts → less speckle (dense grid + area heuristic looks like noise).
-        grid_step = max(24, int(os.environ.get("SAM2_GRID_STEP", "48")))
+        # Balanced defaults recover more canopy while guarding against merged urban blobs.
+        grid_step = max(24, int(os.environ.get("SAM2_GRID_STEP", str(int(thresholds["grid_step"])))))
         points, labels = self._grid_points(side, side, step=min(grid_step, side // 2))
 
         if points.shape[0] == 0:
@@ -731,16 +779,17 @@ class SAM2SegmentationService:
         masks = masks[order]
         scores = scores[order]
 
-        min_mask_score = float(os.environ.get("SAM2_MIN_MASK_SCORE", "0.22"))
-        min_mask_pixels = max(30, int(os.environ.get("SAM2_MIN_MASK_PIXELS", "50")))
+        min_mask_score = float(os.environ.get("SAM2_MIN_MASK_SCORE", str(float(thresholds["min_mask_score"]))))
+        min_mask_pixels = max(30, int(os.environ.get("SAM2_MIN_MASK_PIXELS", str(int(thresholds["min_mask_pixels"])))))
         total_pixels = side * side
-        group_area_threshold = max(200, int(total_pixels * 0.01))
-        min_cc_area = max(25, int(os.environ.get("SAM2_MIN_CC_AREA", "50")))
+        # Keep class-2 conservative enough to prevent blanket "group" masks.
+        group_area_threshold = max(200, int(total_pixels * float(thresholds["group_area_frac"])))
+        min_cc_area = max(25, int(os.environ.get("SAM2_MIN_CC_AREA", str(int(thresholds["min_cc_area"])))))
         veg_gate = os.environ.get("SAM2_VEG_GATE", "1").strip().lower() not in ("0", "false", "no")
-        mask_veg_filter = os.environ.get("SAM2_MASK_VEG_FILTER", "0").strip().lower() in ("1", "true", "yes")
+        mask_veg_filter = os.environ.get("SAM2_MASK_VEG_FILTER", "1").strip().lower() in ("1", "true", "yes")
         exg_small = excess_green_raw(rgb_small) if (veg_gate and mask_veg_filter) else None
-        mask_pixel_exg = float(os.environ.get("SAM2_MASK_PIXEL_EXG", "10"))
-        mask_min_veg_frac = float(os.environ.get("SAM2_MASK_MIN_VEG_FRAC", "0.12"))
+        mask_pixel_exg = float(os.environ.get("SAM2_MASK_PIXEL_EXG", str(float(thresholds["mask_pixel_exg"]))))
+        mask_min_veg_frac = float(os.environ.get("SAM2_MASK_MIN_VEG_FRAC", str(float(thresholds["mask_min_veg_frac"]))))
 
         union = np.zeros((side, side), dtype=np.uint8)
         for mask, sc in zip(masks, scores):
@@ -755,7 +804,7 @@ class SAM2SegmentationService:
                     continue
             union = np.logical_or(union, mask).astype(np.uint8)
 
-        close_u = int(os.environ.get("SAM2_UNION_CLOSE_KERNEL", "5"))
+        close_u = int(os.environ.get("SAM2_UNION_CLOSE_KERNEL", str(int(thresholds["close_kernel"]))))
         if close_u >= 3 and close_u % 2 == 1 and int(union.max()) > 0:
             kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_u, close_u))
             union = cv2.morphologyEx(union, cv2.MORPH_CLOSE, kc)
@@ -768,9 +817,13 @@ class SAM2SegmentationService:
         seg_small = np.zeros((side, side), dtype=np.uint8)
         if int(union.max()) > 0:
             num_labels, cc_labels, stats, _ = cv2.connectedComponentsWithStats(union, connectivity=8)
+            max_component_frac = float(os.environ.get("SAM2_MAX_COMPONENT_FRAC", str(float(thresholds["max_component_frac"]))))
             for i in range(1, num_labels):
                 area = int(stats[i, cv2.CC_STAT_AREA])
                 if area < min_cc_area:
+                    continue
+                if area > int(total_pixels * max_component_frac):
+                    # Huge blobs are usually farms/fields or merged prompt artifacts, not individual canopy clusters.
                     continue
                 region = cc_labels == i
                 seg_small[region] = 2 if area >= group_area_threshold else 1
@@ -786,20 +839,30 @@ class SAM2SegmentationService:
                 seg_mask[strip] = 0
         return image, seg_mask
 
-    def _predict_components(self, image_bytes: bytes, filename: str) -> tuple[Image.Image, np.ndarray, int, str, str]:
+    def _predict_components(
+        self, image_bytes: bytes, filename: str, segment_sensitivity: str = "balanced"
+    ) -> tuple[Image.Image, np.ndarray, int, str, str]:
         self._invalidate_if_checkpoint_changed()
         self._load()
         if self._use_fallback:
             original_image, seg_mask = fallback_segment(image_bytes)
             return original_image, seg_mask, 2, "sam2_fallback", self._fallback_reason
 
-        original_image, seg_mask = self._sam2_segment(image_bytes)
-        return original_image, seg_mask, 2, "sam2_student_checkpoint", ""
+        mode = self._resolve_sensitivity(segment_sensitivity)
+        original_image, seg_mask = self._sam2_segment(image_bytes, segment_sensitivity=mode)
+        return original_image, seg_mask, 2, f"sam2_student_checkpoint_{mode}", ""
 
-    def segment_bytes(self, image_bytes: bytes, filename: str, strict_conservation_mode: bool = False) -> dict:
+    def segment_bytes(
+        self,
+        image_bytes: bytes,
+        filename: str,
+        strict_conservation_mode: bool = False,
+        segment_sensitivity: str = "balanced",
+    ) -> dict:
         original_image, seg_mask, scene_class, inference_mode, fallback_reason = self._predict_components(
             image_bytes,
             filename,
+            segment_sensitivity=segment_sensitivity,
         )
         return build_response(
             original_image=original_image,
