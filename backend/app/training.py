@@ -90,31 +90,44 @@ class TrainingManager:
         """Build child process env and inject model asset vars when applicable."""
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
-        if method != "sam2":
+        # Training children must see the same third-party installs as an interactive interpreter.
+        # IDEs sometimes set PYTHONNOUSERSITE=1, which hides user-site packages (where `pip install`
+        # lands when global site-packages is not writable — e.g. SAM2 from GitHub).
+        env.pop("PYTHONNOUSERSITE", None)
+        if method == "maskrcnn":
+            # Defaults: longer runs + val early stopping; Windows workers=0 avoids DataLoader MemoryError.
+            env.setdefault("MASK_RCNN_EPOCHS", "500")
+            env.setdefault("MASK_RCNN_EARLY_STOPPING_PATIENCE", "50")
+            env.setdefault("MASK_RCNN_EARLY_STOPPING_MIN_DELTA", "1e-4")
+            if sys.platform == "win32":
+                env.setdefault("MASK_RCNN_DATALOADER_WORKERS", "0")
             return env
+        if method == "sam2":
+            # SAM2: optional env overrides; defaults match tree_canopy_multimodel notebook spirit (batch 2, lr 1e-4).
+            env.setdefault("SAM2_MIN_MASK_SCORE", "0.3")
+            env.setdefault("SAM2_BATCH_SIZE", "2")
+            env.setdefault("SAM2_LR", "1e-4")
+            env.setdefault("SAM2_EARLY_STOPPING_PATIENCE", "50")
 
-        # SAM2: optional env overrides; defaults match tree_canopy_multimodel notebook spirit (batch 2, lr 1e-4).
-        env.setdefault("SAM2_MIN_MASK_SCORE", "0.3")
-        env.setdefault("SAM2_BATCH_SIZE", "2")
-        env.setdefault("SAM2_LR", "1e-4")
+            cfg_env = env.get("SAM2_MODEL_CFG") or env.get("MODEL_CFG")
+            if cfg_env:
+                return env
 
-        cfg_env = env.get("SAM2_MODEL_CFG") or env.get("MODEL_CFG")
-        if cfg_env:
+            cfg_candidates = [
+                self.project_root / "checkpoints_sam2" / "sam2_hiera_l.yaml",
+                self.project_root / "sam2_hiera_l.yaml",
+                self.project_root / "configs" / "sam2_hiera_l.yaml",
+                self.project_root / "backend" / "configs" / "sam2_hiera_l.yaml",
+                self.project_root / "checkpoints_sam2" / "sam2_hiera_s.yaml",
+                self.project_root / "sam2_hiera_s.yaml",
+                self.project_root / "configs" / "sam2_hiera_s.yaml",
+                self.project_root / "backend" / "configs" / "sam2_hiera_s.yaml",
+            ]
+            resolved_cfg = self._first_existing_file(cfg_candidates)
+            if resolved_cfg:
+                env["SAM2_MODEL_CFG"] = resolved_cfg
+
             return env
-
-        cfg_candidates = [
-            self.project_root / "checkpoints_sam2" / "sam2_hiera_l.yaml",
-            self.project_root / "sam2_hiera_l.yaml",
-            self.project_root / "configs" / "sam2_hiera_l.yaml",
-            self.project_root / "backend" / "configs" / "sam2_hiera_l.yaml",
-            self.project_root / "checkpoints_sam2" / "sam2_hiera_s.yaml",
-            self.project_root / "sam2_hiera_s.yaml",
-            self.project_root / "configs" / "sam2_hiera_s.yaml",
-            self.project_root / "backend" / "configs" / "sam2_hiera_s.yaml",
-        ]
-        resolved_cfg = self._first_existing_file(cfg_candidates)
-        if resolved_cfg:
-            env["SAM2_MODEL_CFG"] = resolved_cfg
 
         return env
 

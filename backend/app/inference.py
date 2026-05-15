@@ -59,6 +59,20 @@ SEGFORMER_INFERENCE_IMG_SIZE = 512
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_sam2_inference_device() -> str:
+    """Same policy as ``sam2_workflow``: ``SAM2_DEVICE`` / ``TORCH_DEVICE`` (``cuda`` / ``cpu`` / unset=auto)."""
+    raw = (os.environ.get("SAM2_DEVICE") or os.environ.get("TORCH_DEVICE") or "").strip().lower()
+    if raw == "cpu":
+        return "cpu"
+    if raw == "cuda":
+        if not torch.cuda.is_available():
+            logger.warning("SAM2_DEVICE=cuda but torch.cuda.is_available() is False; using cpu")
+            return "cpu"
+        return "cuda"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 SCENE_LABELS = [
     "agriculture_plantation",
     "industrial_area",
@@ -135,12 +149,19 @@ def _land_use_assessment(
 
 
 def _to_hydra_config_name(config_path: Path) -> str:
-    """Convert absolute SAM2 YAML path to Hydra config name."""
+    """Convert absolute SAM2 YAML path to Hydra config name for ``build_sam2``."""
     norm = str(config_path).replace("\\", "/")
+    if norm.startswith("configs/"):
+        return norm
     marker = "/configs/"
     if marker in norm:
         return f"configs/{norm.split(marker, 1)[1]}"
-    return config_path.name
+    base = config_path.name
+    if base.startswith("sam2.1_") and base.endswith(".yaml"):
+        return f"configs/sam2.1/{base}"
+    if base.startswith("sam2_") and base.endswith(".yaml"):
+        return f"configs/sam2/{base}"
+    return base
 
 
 def _infer_project_root() -> Path:
@@ -234,6 +255,17 @@ def _load_sam2_student_state_dict(sam2_model: torch.nn.Module, path: Path) -> No
     sam2_model.load_state_dict(state, strict=False)
 
 
+def resolve_mask_rcnn_checkpoint_path(project_root: Path | None = None) -> Path | None:
+    """Training writes ``best_model.pth`` / ``final_model.pth``; legacy name ``maskrcnn_checkpoint.pth``."""
+    root = project_root or _infer_project_root()
+    d = root / "checkpoints_mask_rcnn"
+    for name in ("maskrcnn_checkpoint.pth", "best_model.pth", "final_model.pth"):
+        p = d / name
+        if p.is_file():
+            return p
+    return None
+
+
 def get_method_precheck(project_root: Path | None = None) -> dict[str, dict]:
     root = project_root or _infer_project_root()
 
@@ -247,8 +279,7 @@ def get_method_precheck(project_root: Path | None = None) -> dict[str, dict]:
     unet_ckpt = root / "checkpoints_unet" / "unet_checkpoint.pth"
     unet_ckpt = unet_ckpt if unet_ckpt.is_file() else None
 
-    maskrcnn_ckpt = root / "checkpoints_mask_rcnn" / "maskrcnn_checkpoint.pth"
-    maskrcnn_ckpt = maskrcnn_ckpt if maskrcnn_ckpt.is_file() else None
+    maskrcnn_ckpt = resolve_mask_rcnn_checkpoint_path(root)
 
     segformer_pth = root / "checkpoints_segformer" / "segformer_checkpoint.pth"
     segformer_candidates = [
@@ -650,9 +681,10 @@ class SAM2SegmentationService:
             return
 
         try:
-            sam2_model = build_sam2(_to_hydra_config_name(model_cfg), None, device="cpu")
+            dev = _resolve_sam2_inference_device()
+            sam2_model = build_sam2(_to_hydra_config_name(model_cfg), None, device=dev)
             _load_sam2_student_state_dict(sam2_model, student_ckpt)
-            logger.info("SAM2 inference: loaded student weights from %s", student_ckpt)
+            logger.info("SAM2 inference: loaded student weights from %s (device=%s)", student_ckpt, dev)
             self._source_ckpt_resolved = str(student_ckpt.resolve())
             self._source_ckpt_mtime = student_ckpt.stat().st_mtime
             self._last_load_fail_ckpt_mtime = None
@@ -990,11 +1022,13 @@ class MaskRCNNSegmentationService:
             self._loaded = True
             return
 
-        ckpt_path = project_root / "checkpoints_mask_rcnn" / "maskrcnn_checkpoint.pth"
-        if not ckpt_path.is_file():
+        ckpt_path = resolve_mask_rcnn_checkpoint_path(project_root)
+        if ckpt_path is None:
             self._use_fallback = True
             self._fallback_reason = (
-                f"Mask R-CNN checkpoint missing at {ckpt_path}; using fallback vegetation segmentation."
+                "Mask R-CNN checkpoint missing under checkpoints_mask_rcnn "
+                "(expected maskrcnn_checkpoint.pth, best_model.pth, or final_model.pth); "
+                "using fallback vegetation segmentation."
             )
             self._loaded = True
             return
@@ -1019,7 +1053,7 @@ class MaskRCNNSegmentationService:
         except Exception:
             self._use_fallback = True
             self._fallback_reason = (
-                "Mask R-CNN model could not be loaded from maskrcnn_checkpoint.pth; using fallback vegetation segmentation."
+                f"Mask R-CNN model could not be loaded from {ckpt_path}; using fallback vegetation segmentation."
             )
         self._loaded = True
 

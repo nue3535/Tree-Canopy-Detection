@@ -6,8 +6,11 @@ const TRAINING_STATUS_POLL_RUNNING_MS = 800;
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
-/** SAM2-only deployment: single model row. */
-const EVALUATION_TABLE_ROWS = [{ key: "sam2", label: "SAM2" }];
+/** Rows for the evaluation accuracy table; order is user-facing priority. */
+const EVALUATION_TABLE_ROWS = [
+  { key: "maskrcnn", label: "Mask R-CNN" },
+  { key: "sam2", label: "SAM2" }
+];
 
 const METHOD_LABELS = Object.fromEntries(EVALUATION_TABLE_ROWS.map(({ key, label }) => [key, label]));
 const SEGMENT_SENSITIVITY_OPTIONS = [
@@ -124,13 +127,23 @@ function App() {
   }, [activeView, trainingStatus?.status]);
 
   const trainingTierNote = useMemo(() => {
+    if (trainingMethod === "maskrcnn") {
+      return (
+        "Mask R-CNN learns detection + instance segmentation together: RPN, box regression, " +
+        "classification (individual_tree vs group_of_trees), and masks. Default 500 epochs with early stopping " +
+        "on val loss (patience 50). Logs print torchvision loss components and a summary line " +
+        "(Epoch NN/500 | train_loss | val_loss | Patience). On Windows, DataLoader workers default to 0 to avoid " +
+        "subprocess MemoryError. Checkpoints: checkpoints_mask_rcnn/best_model.pth (saved on best val_loss)."
+      );
+    }
     return (
-      "SAM2 fine-tunes with GT box prompts (epoch loop, default LR 1e-5, optional early stopping). " +
+      "SAM2 fine-tunes with GT box prompts (epoch loop, default LR 1e-5, early stopping on val loss with default patience 50; " +
+      "set SAM2_EARLY_STOPPING_PATIENCE=0 to disable). " +
       "The “Best quality” label is only the selected profile name—it does not switch SAM2 hyperparameters. " +
       "On Start Training, the API copies the resolved YAML into checkpoints_sam2 and downloads the matching Meta base .pt " +
       "if it is missing (requires network the first time). Expect long runs and high VRAM."
     );
-  }, []);
+  }, [trainingMethod]);
 
   const onFileChange = async (event) => {
     const selected = event.target.files?.[0] || null;
@@ -484,7 +497,8 @@ function App() {
               <label className="seg-field">
                 <span className="seg-field-label">CNN architecture</span>
                 <select value={method} onChange={(event) => setMethod(event.target.value)} aria-label="CNN architecture">
-                  <option value="sam2">SAM2</option>
+                  <option value="maskrcnn">Mask R-CNN (detect + segment)</option>
+                  <option value="sam2">SAM2 (prompted segmentation)</option>
                 </select>
               </label>
               <label className="seg-field">
@@ -597,11 +611,12 @@ function App() {
           <section className="card eval-spec-panel">
             <h2>Model Training & Evaluation</h2>
             <p className="eval-spec-lead">
-              <strong>SAM2:</strong> the table shows <strong>train / validation / test mean IoU</strong> from prompted (box)
-              semantic evaluation (values 0–1, shown as %). They are written to{" "}
-              <code>output/evaluation/sam2/training_results.json</code> when a run finishes; <strong>test</strong> appears
-              only if <code>data/processed/test.txt</code> exists. Reload with <strong>Refresh accuracy table</strong> or
-              when the UI detects a completed or failed run.
+              <strong>Mask R-CNN</strong> trains <strong>object detection + instance segmentation</strong> (boxes, two
+              tree classes, and masks). <strong>SAM2</strong> here is <strong>segmentation with GT box prompts</strong>{" "}
+              (no learned localizer). The table shows train / validation / test metrics from each method’s{" "}
+              <code>training_results.json</code> (SAM2: mean IoU from prompted eval; Mask R-CNN: mask accuracy-style
+              summary from the workflow). Reload with <strong>Refresh accuracy table</strong> or when the UI detects a
+              completed or failed run.
             </p>
 
             <div className="eval-controls">
@@ -610,6 +625,7 @@ function App() {
                 onChange={(e) => setTrainingMethod(e.target.value)}
                 disabled={trainingBusy || trainingStatus?.status === "running"}
               >
+                <option value="maskrcnn">Mask R-CNN</option>
                 <option value="sam2">SAM2</option>
               </select>
               <span className="training-tier-label" title="Only the best-quality training preset is available.">

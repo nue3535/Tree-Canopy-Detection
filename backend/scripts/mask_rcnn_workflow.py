@@ -1,14 +1,19 @@
-"""Mask R-CNN training aligned with tree_canopy_multimodel_training_evaluation_fixed.ipynb:
-maskrcnn_resnet50_fpn(weights=DEFAULT) + replaced ROI heads for 3 classes; 512² inputs; batch 2 / workers 2;
-AdamW lr=1e-4, weight_decay=1e-4, 50 epochs; train step skips samples with no boxes (notebook behavior)."""
+"""Mask R-CNN: joint **object detection** (boxes + class: individual_tree / group_of_trees) and **instance segmentation**
+(mask head), aligned with tree_canopy_multimodel_training_evaluation_fixed.ipynb:
+maskrcnn_resnet50_fpn(weights=DEFAULT) + replaced ROI heads for 3 classes; 512² inputs; batch 2; AdamW lr=1e-4, wd=1e-4;
+default 500 epochs with optional validation early stopping (patience 50). On Windows, DataLoader workers default to 0 to avoid spawn MemoryErrors.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import sys
 import time
 import traceback
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,10 +90,12 @@ class TrainConfig:
     batch_size: int = 2
     img_size: int = 512
     max_instances_per_image: int = 80
-    epochs: int = 50
+    epochs: int = 500
     lr: float = 1e-4
     weight_decay: float = 1e-4
-    workers: int = 2
+    workers: int = 0 if sys.platform == "win32" else 2
+    early_stopping_patience: int = 50
+    early_stopping_min_delta: float = 1e-4
 
 
 def _build_mask_rcnn(num_classes: int = 3) -> torch.nn.Module:
@@ -141,9 +148,8 @@ class DetectionDataset(Dataset):
             image, inst_masks_resized = apply_augmentation(image, inst_masks_resized)
 
         image_t = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-        scale_x = float(self.img_size) / float(max(1, orig_w))
-        scale_y = float(self.img_size) / float(max(1, orig_h))
 
+        h, w = image.shape[:2]
         masks = []
         labels = []
         boxes = []
@@ -152,15 +158,26 @@ class DetectionDataset(Dataset):
         for m, label in zip(inst_masks_resized, inst_labels):
             if int(m.sum()) < 10:
                 continue
+            if m.shape[0] != h or m.shape[1] != w:
+                m = cv2.resize(m.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
             ys, xs = np.where(m > 0)
             x_min = float(xs.min())
             y_min = float(ys.min())
             x_max = float(xs.max())
             y_max = float(ys.max())
+            # torchvision requires strictly positive width/height (no degenerate lines/points).
+            if x_max <= x_min:
+                x_max = x_min + 1.0
+            if y_max <= y_min:
+                y_max = y_min + 1.0
+            x_min = max(0.0, min(x_min, float(w - 1)))
+            y_min = max(0.0, min(y_min, float(h - 1)))
+            x_max = max(x_min + 1.0, min(x_max, float(w)))
+            y_max = max(y_min + 1.0, min(y_max, float(h)))
             boxes.append([x_min, y_min, x_max, y_max])
             masks.append(m.astype(np.uint8))
             labels.append(label)
-            areas.append(float((x_max - x_min) * (y_max - y_min) * scale_x * scale_y))
+            areas.append(float(np.count_nonzero(m)))
 
         if not boxes:
             h, w = image.shape[:2]
@@ -183,6 +200,47 @@ class DetectionDataset(Dataset):
 def _collate_fn(batch):
     images, targets = zip(*batch)
     return list(images), list(targets)
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+@torch.no_grad()
+def _mean_loss_on_loader(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> float:
+    """Mean summed detection loss over ``loader`` (train mode; no backward)."""
+    model.train()
+    totals: list[float] = []
+    for images, targets in loader:
+        filtered_images: list[torch.Tensor] = []
+        filtered_targets: list[dict] = []
+        for img, tgt in zip(images, targets):
+            boxes = tgt.get("boxes")
+            if boxes is None or boxes.numel() == 0 or boxes.shape[0] == 0:
+                continue
+            filtered_images.append(img.to(device))
+            filtered_targets.append({k: v.to(device) for k, v in tgt.items()})
+        if not filtered_images:
+            continue
+        losses = model(filtered_images, filtered_targets)
+        totals.append(float(sum(v.detach().cpu().item() for v in losses.values())))
+    return float(np.mean(totals)) if totals else float("nan")
 
 
 def _load_records(config: TrainConfig) -> tuple[list[dict], list[dict]]:
@@ -458,9 +516,18 @@ def train(config: TrainConfig) -> None:
     config.save_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_records, val_records = _load_records(config)
+    use_early_stop = config.early_stopping_patience > 0 and len(val_records) > 0
+    early_stopper: EarlyStopping | None = None
+    if use_early_stop:
+        early_stopper = EarlyStopping(
+            patience=config.early_stopping_patience,
+            min_delta=config.early_stopping_min_delta,
+            mode="min",
+        )
     print(
         f"[Mask R-CNN] device={device} train={len(train_records)} val={len(val_records)} epochs={config.epochs} "
-        f"batch_size={config.batch_size} img_size={config.img_size} max_instances={config.max_instances_per_image}",
+        f"batch_size={config.batch_size} img_size={config.img_size} max_instances={config.max_instances_per_image} "
+        f"workers={config.workers} early_stop_patience={config.early_stopping_patience if use_early_stop else 0}",
         flush=True,
     )
     loader = DataLoader(
@@ -469,17 +536,30 @@ def train(config: TrainConfig) -> None:
         shuffle=True,
         num_workers=config.workers,
         collate_fn=_collate_fn,
+        persistent_workers=config.workers > 0,
+    )
+    val_loader = DataLoader(
+        DetectionDataset(val_records, config.img_size, config.max_instances_per_image, training=False),
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.workers,
+        collate_fn=_collate_fn,
+        persistent_workers=config.workers > 0,
     )
 
     model = _build_mask_rcnn(num_classes=3).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    early_stopping = EarlyStopping(patience=999)
 
-    best_loss = float("inf")
+    best_val_saved: float | None = None
+    min_train_loss_seen = float("inf")
+    stopped_early = False
+    epoch_done = 0
     try:
         for epoch in range(config.epochs):
             model.train()
             epoch_losses = []
+            loss_totals: defaultdict[str, float] = defaultdict(float)
+            loss_batches = 0
             pbar = tqdm(loader, desc=f"[Mask R-CNN][Train] epoch {epoch+1}/{config.epochs}", dynamic_ncols=True)
             for batch_idx, (images, targets) in enumerate(pbar, start=1):
                 filtered_images: list[torch.Tensor] = []
@@ -494,6 +574,9 @@ def train(config: TrainConfig) -> None:
                     continue
                 losses = model(filtered_images, filtered_targets)
                 total_loss = sum(loss for loss in losses.values())
+                for k, v in losses.items():
+                    loss_totals[k] += float(v.detach().cpu().item())
+                loss_batches += 1
                 optimizer.zero_grad()
                 total_loss.backward()
                 optimizer.step()
@@ -506,17 +589,61 @@ def train(config: TrainConfig) -> None:
                         f"batch={batch_idx}/{len(loader)} loss={running_loss:.4f}",
                         flush=True,
                     )
-            mean_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
-            print(f"[Mask R-CNN] epoch={epoch+1}/{config.epochs} mean_loss={mean_loss:.4f}", flush=True)
-            if mean_loss < best_loss:
-                best_loss = mean_loss
+            mean_train_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+            if epoch_losses:
+                min_train_loss_seen = min(min_train_loss_seen, mean_train_loss)
+            if loss_batches > 0:
+                parts = [f"{k}={loss_totals[k] / loss_batches:.4f}" for k in sorted(loss_totals.keys())]
+                print(
+                    f"[Mask R-CNN] epoch={epoch+1}/{config.epochs} mean_train={mean_train_loss:.4f} | " + " ".join(parts),
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[Mask R-CNN] epoch={epoch+1}/{config.epochs} mean_train={mean_train_loss:.4f} (no batches)",
+                    flush=True,
+                )
+
+            val_mean_loss = _mean_loss_on_loader(model, val_loader, device)
+            if not math.isnan(val_mean_loss) and (
+                best_val_saved is None
+                or val_mean_loss < best_val_saved - config.early_stopping_min_delta
+            ):
+                best_val_saved = val_mean_loss
                 torch.save(
-                    {"epoch": epoch, "mean_loss": mean_loss, "model_state_dict": model.state_dict()},
+                    {
+                        "epoch": epoch,
+                        "val_loss": val_mean_loss,
+                        "mean_train_loss": mean_train_loss,
+                        "model_state_dict": model.state_dict(),
+                    },
                     config.save_dir / "best_model.pth",
                 )
-                print(f"[Mask R-CNN] saved best checkpoint: {config.save_dir / 'best_model.pth'}", flush=True)
-            if early_stopping.should_stop(-mean_loss):
-                print(f"[Mask R-CNN] early stopping at epoch {epoch+1}", flush=True)
+                print(
+                    f"[Mask R-CNN] saved best checkpoint (val_loss={val_mean_loss:.4f}): "
+                    f"{config.save_dir / 'best_model.pth'}",
+                    flush=True,
+                )
+
+            stop_now = False
+            if early_stopper is not None and not math.isnan(val_mean_loss):
+                _, stop_now = early_stopper.step(val_mean_loss)
+
+            log_msg = (
+                f"Epoch {epoch+1:02d}/{config.epochs} | train_loss={mean_train_loss:.4f}"
+                + (f" | val_loss={val_mean_loss:.4f}" if not math.isnan(val_mean_loss) else " | val_loss=nan")
+            )
+            if early_stopper is not None and not math.isnan(val_mean_loss):
+                log_msg += f" | Patience: {early_stopper.counter}/{early_stopper.patience}"
+            print(log_msg, flush=True)
+
+            epoch_done = epoch + 1
+            if stop_now:
+                stopped_early = True
+                print(
+                    f"[Mask R-CNN] early stopping: no val_loss improvement for {config.early_stopping_patience} epochs.",
+                    flush=True,
+                )
                 break
     except Exception as exc:
         print(f"[Mask R-CNN][ERROR] {exc}", flush=True)
@@ -524,7 +651,30 @@ def train(config: TrainConfig) -> None:
         raise
 
     torch.save({"model_state_dict": model.state_dict()}, config.save_dir / "final_model.pth")
-    print(f"[Mask R-CNN] complete. Best loss={best_loss:.4f}. Saved to {config.save_dir}", flush=True)
+    if best_val_saved is not None:
+        print(
+            f"[Mask R-CNN] complete. best_val_loss={best_val_saved:.4f} epochs_run={epoch_done}. Saved to {config.save_dir}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[Mask R-CNN] complete. best_val_loss=(none) epochs_run={epoch_done}. Saved to {config.save_dir}",
+            flush=True,
+        )
+
+    best_path = config.save_dir / "best_model.pth"
+    if best_path.is_file():
+        try:
+            try:
+                ckpt = torch.load(best_path, map_location=device, weights_only=False)
+            except TypeError:
+                ckpt = torch.load(best_path, map_location=device)
+            sd = ckpt.get("model_state_dict") if isinstance(ckpt, dict) else ckpt
+            if isinstance(sd, dict):
+                model.load_state_dict(sd, strict=False)
+                print("[Mask R-CNN] loaded best val checkpoint for accuracy + eval artifacts.", flush=True)
+        except Exception as exc:
+            print(f"[WARN] Could not load best checkpoint for final eval: {exc}", flush=True)
 
     print("[Mask R-CNN] Computing training results...", flush=True)
     train_acc = _compute_maskrcnn_accuracy(model, train_records, config, device)
@@ -537,10 +687,22 @@ def train(config: TrainConfig) -> None:
         "train_accuracy": train_acc,
         "val_accuracy": val_acc,
         "test_accuracy": test_acc,
-        "best_train_loss": round(best_loss, 6),
-        "epochs": config.epochs,
+        "best_val_loss": None if best_val_saved is None else round(float(best_val_saved), 6),
+        "best_train_loss": round(min_train_loss_seen, 6) if min_train_loss_seen != float("inf") else None,
+        "epochs": epoch_done,
+        "max_epochs": config.epochs,
+        "stopped_early": stopped_early,
+        "early_stopping": {
+            "patience": config.early_stopping_patience if use_early_stop else 0,
+            "min_delta": config.early_stopping_min_delta if use_early_stop else None,
+            "monitor": "val_loss",
+            "enabled": use_early_stop,
+        },
         "timestamp": int(time.time()),
-        "config_note": "Aligned with multimodel notebook: Mask R-CNN ResNet50-FPN (COCO-pretrained backbone), 512, batch 2, 50 epochs, AdamW 1e-4, wd 1e-4.",
+        "config_note": (
+            "Mask R-CNN ResNet50-FPN, 512², AdamW. Default 500 epochs; early stopping on val_loss when patience>0. "
+            "Windows: num_workers=0 recommended (avoids DataLoader spawn MemoryError)."
+        ),
     }
     (eval_root / "training_results.json").write_text(
         json.dumps(training_results, indent=2), encoding="utf-8",
@@ -555,15 +717,34 @@ def train(config: TrainConfig) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    _win = sys.platform == "win32"
+    _default_workers = 0 if _win else 2
     parser = argparse.ArgumentParser(description="Mask R-CNN training workflow")
     parser.add_argument("action", choices=["train"], default="train")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=_int_env("MASK_RCNN_EPOCHS", 500))
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--img-size", type=int, default=512)
     parser.add_argument("--max-instances-per-image", type=int, default=80)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=_int_env("MASK_RCNN_DATALOADER_WORKERS", _default_workers),
+        help="DataLoader workers (0 required on many Windows setups to avoid MemoryError in spawn workers).",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=_int_env("MASK_RCNN_EARLY_STOPPING_PATIENCE", 50),
+        help="Stop if val_loss does not improve for this many epochs; 0 disables.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=_float_env("MASK_RCNN_EARLY_STOPPING_MIN_DELTA", 1e-4),
+        help="Minimum val_loss decrease to count as improvement.",
+    )
     return parser.parse_args()
 
 
@@ -582,6 +763,8 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
         workers=args.workers,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
     )
     if args.action == "train":
         train(config)

@@ -1,6 +1,17 @@
 """
 Train/Fine-Tune SAM 2 on a custom dataset using polygon annotations.
 
+**Task shape (important):** this workflow does **not** learn *where* trees are (no bounding-box
+regression or class logits for localization). It is **prompted instance segmentation**: ground-truth
+boxes from your labels are fed to SAM2’s prompt encoder, and the mask decoder is trained to match
+each instance mask. That is appropriate when boxes are known at train time (from polygons) and you
+want sharper masks than a pure semantic model.
+
+For **joint object detection + instance segmentation** (learn to predict boxes and class
+``individual_tree`` vs ``group_of_trees`` together with masks), use ``backend/scripts/mask_rcnn_workflow.py``
+(Mask R-CNN) and the **Mask R-CNN** training option in the Evaluation UI — that matches the
+Faster R-CNN / YOLO-style “boxes + classes + masks” paradigm.
+
 Reference note: batch_grounded_sam.py uses Hugging Face SAM ViT-Base + GroundingDINO (zero-shot),
 not Meta SAM2. Fine-tuning loads a **base** Meta ``.pt`` (see ``SAM2_BASE_CHECKPOINT``) plus a Hiera YAML,
 trains the prompt encoder + mask decoder with **GT box** prompts, and exports student weights to
@@ -17,10 +28,11 @@ and fine-tune with box prompts at ``SAM2_PROMPT_IMAGE_SIZE`` (default 512).
 Notes:
 - Default: freeze the image encoder (``SAM2_FREEZE_IMAGE_ENCODER``); set to ``0`` to unfreeze.
 - Epochs / LR / WD: ``SAM2_TRAIN_EPOCHS``, ``SAM2_TRAIN_LR``, ``SAM2_TRAIN_WEIGHT_DECAY``.
-- Early stopping on validation loss: ``SAM2_EARLY_STOPPING_PATIENCE`` (default 25; ``0`` disables),
+- Early stopping on validation loss: ``SAM2_EARLY_STOPPING_PATIENCE`` (default 50; ``0`` disables),
   ``SAM2_EARLY_STOPPING_MIN_DELTA``. Best ``val_loss`` weights are restored before saving the student checkpoint.
 - Training log cadence: each epoch prints start lines for train/val; every ``SAM2_TRAIN_LOG_EVERY`` images (default 10)
   prints progress within an epoch; set ``SAM2_TRAIN_LOG_EVERY=0`` to disable mid-epoch lines only.
+- Post-training prompted IoU eval uses ``SAM2_PROMPTED_EVAL_BOX_CHUNK`` (default ``1``) boxes per ``predict()`` to avoid CUDA OOM on the mask decoder when images have many instances.
 - Epoch checkpoints: ``checkpoints_sam2/sam2_training_latest.pt`` (full resume state after each epoch) and
   ``sam2_training_best.pt`` (best val_loss weights). Set ``SAM2_RESUME=1`` to continue from ``latest`` (skips warm-start
   from the inference export if ``latest`` exists).
@@ -32,6 +44,7 @@ Requirements:
   - torch, numpy, opencv-python, tqdm, matplotlib
   - ``sam2`` (Segment Anything 2) with a matching Hiera YAML
   - Base checkpoint ``.pt`` on disk (``SAM2_CHECKPOINT`` / ``checkpoints_sam2/*.pt``)
+  - Device: ``cuda`` when ``torch.cuda.is_available()`` else ``cpu``; set ``SAM2_DEVICE=cuda`` to fail if CUDA is missing.
 
 Workflow overview:
   1) Load annotations; use ``train.txt`` / ``val.txt`` / optional ``test.txt`` when present.
@@ -41,6 +54,7 @@ Workflow overview:
 """
 
 import os  # OS utilities (paths, env vars, directories)
+import sys  # Executable path for actionable import errors
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # Allow duplicate OpenMP runtimes on Windows
 os.environ.setdefault("OMP_NUM_THREADS", "1")  # Limit OpenMP threads to reduce contention
 
@@ -49,6 +63,7 @@ import json  # JSON parsing for annotations
 import math  # isnan for training_results serialization
 import time  # Per-epoch duration logging
 from pathlib import Path
+import gc
 import random  # Deterministic splitting and sampling
 from typing import List, Tuple, Dict, Any  # Type hints for clarity
 
@@ -59,11 +74,13 @@ import torch  # Tensors, autograd, CUDA, optimizers, AMP
 import torch.nn.functional as F  # BCE-with-logits and losses for SAM2 fine-tune
 import cv2  # Image I/O and geometry (OpenCV)
 
+_sam2_import_error: BaseException | None = None
 try:
     from sam2.build_sam import build_sam2  # SAM2 model factory
     from sam2.sam2_image_predictor import SAM2ImagePredictor  # High-level predictor wrapper
     import sam2 as _sam2_pkg
-except Exception:
+except BaseException as _exc:
+    _sam2_import_error = _exc
     build_sam2 = None
     SAM2ImagePredictor = None
     _sam2_pkg = None
@@ -130,18 +147,34 @@ def _to_hydra_config_name(config_path: str) -> str:
     Convert absolute config file paths into Hydra-compatible config names for `sam2`.
     Hydra `compose(config_name=...)` expects names like `configs/sam2/sam2_hiera_s.yaml`,
     not absolute filesystem paths.
+
+    Important: short names like ``sam2_hiera_l.yaml`` resolve inside the installed ``sam2``
+    package to *stub* YAML files (one-line pointers), not the full model config. Passing those
+    to ``build_sam2`` breaks ``instantiate(cfg.model)``. Map known Meta basenames to
+    ``configs/sam2/...`` or ``configs/sam2.1/...`` instead.
     """
     if not config_path:
         return config_path
+    norm = config_path.replace("\\", "/")
     if not os.path.isabs(config_path):
+        if norm.startswith("configs/"):
+            return norm
+        base = os.path.basename(norm)
+        if base.startswith("sam2.1_") and base.endswith(".yaml"):
+            return f"configs/sam2.1/{base}"
+        if base.startswith("sam2_") and base.endswith(".yaml"):
+            return f"configs/sam2/{base}"
         return config_path
 
-    norm = config_path.replace("\\", "/")
     marker = "/configs/"
     if marker in norm:
-        # Keep the package-relative suffix beginning at "configs/..."
         return f"configs/{norm.split(marker, 1)[1]}"
-    return os.path.basename(norm)
+    base = os.path.basename(norm)
+    if base.startswith("sam2.1_") and base.endswith(".yaml"):
+        return f"configs/sam2.1/{base}"
+    if base.startswith("sam2_") and base.endswith(".yaml"):
+        return f"configs/sam2/{base}"
+    return base
 
 
 if resolve_train_image_dir is not None:
@@ -239,6 +272,9 @@ SAM2_TRAIN_EPOCHS = int(os.getenv("SAM2_TRAIN_EPOCHS", "500"))
 SAM2_TRAIN_LR = float(os.getenv("SAM2_TRAIN_LR", "1e-5"))
 SAM2_TRAIN_WEIGHT_DECAY = float(os.getenv("SAM2_TRAIN_WEIGHT_DECAY", "4e-5"))
 SAM2_MAX_INSTANCES_PER_IMAGE = int(os.getenv("SAM2_MAX_INSTANCES_PER_IMAGE", "8"))
+# Post-training ``evaluate_sam2_prompted`` batches boxes per ``predict()``; large batches OOM the
+# mask decoder on typical 8GB GPUs. Default 1 matches one-box training forwards.
+SAM2_PROMPTED_EVAL_BOX_CHUNK = max(1, int(os.getenv("SAM2_PROMPTED_EVAL_BOX_CHUNK", "1")))
 SAM2_FREEZE_IMAGE_ENCODER = os.getenv("SAM2_FREEZE_IMAGE_ENCODER", "1").strip().lower() not in (
     "0",
     "false",
@@ -246,7 +282,7 @@ SAM2_FREEZE_IMAGE_ENCODER = os.getenv("SAM2_FREEZE_IMAGE_ENCODER", "1").strip().
 )
 SAM2_PROMPT_IMAGE_SIZE = int(os.getenv("SAM2_PROMPT_IMAGE_SIZE", "512"))
 SAM2_FINETUNED_WEIGHTS = SAM2_STUDENT_EXPORT
-SAM2_EARLY_STOPPING_PATIENCE = int(os.getenv("SAM2_EARLY_STOPPING_PATIENCE", "25"))
+SAM2_EARLY_STOPPING_PATIENCE = int(os.getenv("SAM2_EARLY_STOPPING_PATIENCE", "50"))
 SAM2_EARLY_STOPPING_MIN_DELTA = float(os.getenv("SAM2_EARLY_STOPPING_MIN_DELTA", "1e-4"))
 # Within-epoch image progress (0 disables mid-epoch lines; epoch start/end always logged).
 SAM2_TRAIN_LOG_EVERY = int(os.getenv("SAM2_TRAIN_LOG_EVERY", "10"))
@@ -994,21 +1030,32 @@ def evaluate_sam2_prompted(
         boxes[:, [0, 2]] *= sx
         boxes[:, [1, 3]] *= sy
 
-        masks, scores, _ = predictor.predict(
-            point_coords=None,
-            point_labels=None,
-            box=boxes,
-            multimask_output=False,
-        )
+        # One ``predict(box=ALL)`` batches every instance through the transformer and can OOM on
+        # consumer GPUs; chunk prompts then merge by score (same semantics as global argsort).
+        chunk = SAM2_PROMPTED_EVAL_BOX_CHUNK
+        scored: List[Tuple[np.ndarray, float, int]] = []
+        for start in range(0, len(boxes), chunk):
+            end = min(len(boxes), start + chunk)
+            box_chunk = boxes[start:end]
+            masks, scores, _ = predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=box_chunk,
+                multimask_output=False,
+            )
+            masks = np.asarray(masks)
+            scores_arr = np.asarray(scores, dtype=np.float64).reshape(-1)
+            if masks.ndim == 2:
+                masks = masks[np.newaxis, ...]
+            if masks.ndim == 4:
+                masks = masks[:, 0]
+            for j in range(end - start):
+                m = masks[j]
+                sc = float(scores_arr[j]) if j < scores_arr.size else 0.0
+                scored.append((m, sc, int(labels[start + j])))
 
-        masks = np.asarray(masks)
-        if masks.ndim == 4:
-            masks = masks[:, 0]
-
-        order = np.argsort(np.asarray(scores).reshape(-1))
-        for idx in order:
-            m = masks[idx]
-            cls_id = int(labels[idx])
+        scored.sort(key=lambda t: t[1])
+        for m, _sc, cls_id in scored:
             pred_mask[m > 0] = cls_id
 
         pixel_accs.append(_compute_pixel_accuracy_semantic(pred_mask, gt_mask))
@@ -1031,6 +1078,24 @@ def _ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)  # Make dirs
 
 
+def _resolve_sam2_torch_device() -> str:
+    """``cuda`` vs ``cpu`` for SAM2. Override with ``SAM2_DEVICE`` or ``TORCH_DEVICE``: ``cuda`` / ``cpu`` / ``auto``."""
+    raw = (os.environ.get("SAM2_DEVICE") or os.environ.get("TORCH_DEVICE") or "").strip().lower()
+    if raw in ("", "auto"):
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if raw == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "SAM2_DEVICE=cuda but torch.cuda.is_available() is False. "
+                "Install a CUDA-enabled PyTorch build (e.g. Python 3.14 on Windows: "
+                "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130)."
+            )
+        return "cuda"
+    if raw == "cpu":
+        return "cpu"
+    raise ValueError(f"Invalid SAM2_DEVICE/TORCH_DEVICE={raw!r}; use cuda, cpu, or auto.")
+
+
 def _validate_runtime_prerequisites() -> None:
     """Validate required runtime dependencies and minimum model assets."""
     missing_assets = []
@@ -1038,9 +1103,21 @@ def _validate_runtime_prerequisites() -> None:
         missing_assets.append(f"MODEL_CFG not found: {MODEL_CFG}")
 
     if build_sam2 is None or SAM2ImagePredictor is None:
+        extra = ""
+        if _sam2_import_error is not None:
+            extra = f"\nUnderlying error: {_sam2_import_error!r}"
+        nous = os.environ.get("PYTHONNOUSERSITE", "").strip().lower() in ("1", "true", "yes")
+        if nous:
+            extra += (
+                "\nPYTHONNOUSERSITE is set: user-site packages are disabled, so a user-level "
+                "`pip install` of SAM2 is invisible. Unset it for this process, use a venv, or "
+                "`python -m pip install \"git+https://github.com/facebookresearch/sam2.git\"` "
+                "into the environment's site-packages."
+            )
         raise RuntimeError(
             "Could not import SAM2 modules (`sam2.build_sam`, `sam2.sam2_image_predictor`). "
-            "Install/configure the Segment Anything 2 environment first."
+            f"Python: {sys.executable}{extra}\n"
+            "Install SAM2 with: python -m pip install \"git+https://github.com/facebookresearch/sam2.git\""
         )
 
     if missing_assets:
@@ -1337,7 +1414,17 @@ def main():
     ``checkpoints_sam2/``, then report semantic segmentation metrics from box-prompted inference.
     """
     _validate_runtime_prerequisites()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _resolve_sam2_torch_device()
+    print(f"[INFO] PyTorch {torch.__version__} | cuda.is_available()={torch.cuda.is_available()}", flush=True)
+    if torch.cuda.is_available():
+        print(f"[INFO] CUDA device 0: {torch.cuda.get_device_name(0)}", flush=True)
+    print(f"[INFO] SAM2 compute device: {device}", flush=True)
+    if device == "cpu":
+        print(
+            "[WARN] SAM2 is on CPU (slow). Install CUDA PyTorch to use your GPU, e.g.: "
+            "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130",
+            flush=True,
+        )
     cfg_source = "env" if (os.getenv("SAM2_MODEL_CFG") or os.getenv("MODEL_CFG")) else "auto/default"
     model_cfg_hydra = _to_hydra_config_name(MODEL_CFG)
     print(f"[INFO] SAM2 model cfg: {MODEL_CFG} (source: {cfg_source})")
@@ -1612,6 +1699,7 @@ def main():
         print("[WARN] Could not plot train loss curve:", e)
 
     predictor.model.eval()
+    gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
 

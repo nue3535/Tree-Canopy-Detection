@@ -1,3 +1,6 @@
+# PyTorch: PyPI often resolves to a CPU-only wheel. For NVIDIA GPU (training + SAM2 API), install CUDA builds first, e.g.
+#   Python 3.14 (Windows): pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+#   Many 3.10–3.12 setups:       pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 numpy
 opencv-python
 torch
@@ -16,3 +19,5 @@ fastapi
 uvicorn
 python-multipart
 transformers
+# Segment Anything 2 (import name `sam2`); install from Meta GitHub — not on PyPI as `sam2`
+git+https://github.com/facebookresearch/sam2.git

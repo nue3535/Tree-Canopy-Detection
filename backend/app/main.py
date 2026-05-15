@@ -12,7 +12,7 @@ from pydantic import BaseModel
 os.environ.setdefault("MPLCONFIGDIR", str(Path(".").resolve() / ".mplconfig"))
 
 from backend.app.evaluation import EvaluationService
-from backend.app.inference import SAM2SegmentationService, get_method_precheck
+from backend.app.inference import MaskRCNNSegmentationService, SAM2SegmentationService, get_method_precheck
 from backend.app.training import TrainingManager
 
 app = FastAPI(title="Tree Canopy Segmentation API", version="1.0.0")
@@ -25,10 +25,12 @@ app.add_middleware(
 )
 
 sam2_service = SAM2SegmentationService()
+maskrcnn_service = MaskRCNNSegmentationService()
 SEGMENTATION_SERVICES = {
+    "maskrcnn": maskrcnn_service,
     "sam2": sam2_service,
 }
-TRAINABLE_METHODS = set(SEGMENTATION_SERVICES.keys())
+TRAINABLE_METHODS = frozenset({"sam2", "maskrcnn"})
 evaluation_service = EvaluationService(SEGMENTATION_SERVICES)
 training_manager = TrainingManager()
 
@@ -129,7 +131,7 @@ async def segment_image(
         if selected_service is None:
             raise HTTPException(
                 status_code=400,
-                detail="Invalid method. Only sam2 is enabled.",
+                detail=f"Invalid method. Choose one of: {', '.join(sorted(SEGMENTATION_SERVICES))}.",
             )
         if method_key == "sam2":
             result = selected_service.segment_bytes(
@@ -187,7 +189,7 @@ def training_results() -> TrainingResultsResponse:
     project_root = Path(__file__).resolve().parents[2]
     eval_root = project_root / "output" / "evaluation"
     results: dict = {}
-    for method in SEGMENTATION_SERVICES:
+    for method in TRAINABLE_METHODS:
         results_path = eval_root / method / "training_results.json"
         if results_path.exists():
             try:
@@ -216,7 +218,7 @@ def evaluation_page(
     if method_key not in valid_methods:
         raise HTTPException(
             status_code=400,
-            detail="method must be one of: sam2, all.",
+            detail=f"method must be one of: {', '.join(sorted(valid_methods))}.",
         )
     page_size = max(1, min(page_size, 50))
 
@@ -241,7 +243,7 @@ def start_training(method: str = Form(...), profile: str = Form("best-quality"))
     if method_key not in TRAINABLE_METHODS:
         raise HTTPException(
             status_code=400,
-            detail="method must be one of: sam2.",
+            detail=f"method must be one of: {', '.join(sorted(TRAINABLE_METHODS))}.",
         )
     if profile_key not in TrainingManager.SUPPORTED_PROFILES:
         raise HTTPException(
@@ -269,7 +271,7 @@ def training_status(method: str) -> TrainingStatusResponse:
     if method_key not in TRAINABLE_METHODS:
         raise HTTPException(
             status_code=400,
-            detail="method must be one of: sam2.",
+            detail=f"method must be one of: {', '.join(sorted(TRAINABLE_METHODS))}.",
         )
     try:
         payload = training_manager.get_status(method_key)
@@ -284,7 +286,7 @@ def stop_training(method: str = Form(...)) -> TrainingStopResponse:
     if method_key not in TRAINABLE_METHODS:
         raise HTTPException(
             status_code=400,
-            detail="method must be one of: sam2.",
+            detail=f"method must be one of: {', '.join(sorted(TRAINABLE_METHODS))}.",
         )
     try:
         payload = training_manager.stop_training(method_key)
