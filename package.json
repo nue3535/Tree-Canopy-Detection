@@ -1,0 +1,12 @@
+{
+  "name": "tree-canopy-detection",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tree canopy detection — React frontend + FastAPI backend",
+  "scripts": {
+    "dev": "npm run dev --prefix frontend",
+    "build": "npm run build --prefix frontend",
+    "preview": "npm run preview --prefix frontend",
+    "install:frontend": "npm install --prefix frontend"
+  }
+}

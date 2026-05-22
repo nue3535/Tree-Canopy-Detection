@@ -99,18 +99,13 @@ def resolve_sam2_yaml(project_root: Path, env: dict[str, str]) -> Path:
 
 def _ssl_context_for_download() -> ssl.SSLContext:
     """Prefer certifi's CA bundle (fixes many macOS/Python SSL verify failures)."""
-    flag = (os.environ.get("SAM2_DOWNLOAD_INSECURE") or "").strip().lower()
-    if flag in ("1", "true", "yes"):
-        logger.warning(
-            "SAM2_DOWNLOAD_INSECURE is set: SSL verification is disabled for SAM2 checkpoint download."
-        )
-        return ssl._create_unverified_context()
-    try:
-        import certifi
+    from backend.app.ssl_downloads import download_insecure_enabled, ssl_context_for_download
 
-        return ssl.create_default_context(cafile=certifi.where())
-    except ImportError:
-        return ssl.create_default_context()
+    if download_insecure_enabled():
+        logger.warning(
+            "SAM2_DOWNLOAD_INSECURE (or PYTORCH_DOWNLOAD_INSECURE) is set: SSL verification disabled for downloads."
+        )
+    return ssl_context_for_download()
 
 
 def meta_checkpoint_spec_for_yaml(yaml_path: Path) -> tuple[str, str]:

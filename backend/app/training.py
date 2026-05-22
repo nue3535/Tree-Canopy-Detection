@@ -95,12 +95,13 @@ class TrainingManager:
         # lands when global site-packages is not writable — e.g. SAM2 from GitHub).
         env.pop("PYTHONNOUSERSITE", None)
         if method == "maskrcnn":
-            # Defaults: longer runs + val early stopping; Windows workers=0 avoids DataLoader MemoryError.
+            # Defaults: longer runs + val early stopping; workers=0 on macOS/Windows avoids OOM from spawn.
             env.setdefault("MASK_RCNN_EPOCHS", "500")
             env.setdefault("MASK_RCNN_EARLY_STOPPING_PATIENCE", "50")
             env.setdefault("MASK_RCNN_EARLY_STOPPING_MIN_DELTA", "1e-4")
-            if sys.platform == "win32":
+            if sys.platform in {"win32", "darwin"}:
                 env.setdefault("MASK_RCNN_DATALOADER_WORKERS", "0")
+                env.setdefault("MASK_RCNN_BATCH_SIZE", "1")
             return env
         if method == "sam2":
             # SAM2: optional env overrides; defaults match tree_canopy_multimodel notebook spirit (batch 2, lr 1e-4).

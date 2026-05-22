@@ -46,7 +46,7 @@ GeoTIFF (`.tif` / `.tiff`) and raster-friendly formats are supported alongside P
 - **`sam2`** (default): SAM2 student weights with **ground-truth style box prompts** at inference (segmentation-focused path; requires fine-tuned checkpoint under `checkpoints_sam2/`).
 - **`maskrcnn`**: Mask R-CNN for **detection + instance segmentation** (two tree-related classes plus background); loads weights from `checkpoints_mask_rcnn/` when present.
 
-Other form fields include `strict_conservation_mode` and, for SAM2, `segment_sensitivity`. If dependencies or weights are missing, services can fall back with a reason string in the JSON response.
+Other form fields include `strict_conservation_mode`. SAM2 and Mask R-CNN use fixed inference presets tuned for tree canopy (not exposed in the UI). If dependencies or weights are missing, services can fall back with a reason string in the JSON response.
 
 ## Backend API (summary)
 
@@ -148,7 +148,8 @@ When training is started via the API, `training.py` injects conservative default
 |--------|----------|----------------------------------------|
 | Mask R-CNN | `MASK_RCNN_EPOCHS` | `500` |
 | Mask R-CNN | `MASK_RCNN_EARLY_STOPPING_PATIENCE` | `50` (`0` disables early stopping) |
-| Mask R-CNN | `MASK_RCNN_DATALOADER_WORKERS` | `0` on Windows (avoids multiprocessing `MemoryError` in subprocesses) |
+| Mask R-CNN | `MASK_RCNN_DATALOADER_WORKERS` | `0` on macOS/Windows (avoids multiprocessing OOM in subprocesses) |
+| Mask R-CNN | `MASK_RCNN_BATCH_SIZE` | `1` on macOS when started from the API (CPU/MPS memory) |
 | SAM2 | `SAM2_EARLY_STOPPING_PATIENCE` | `50` (`0` disables) |
 
 SAM2 training behavior is extensively configurable in `backend/scripts/sam2_workflow.py` (epochs `SAM2_TRAIN_EPOCHS`, LR `SAM2_TRAIN_LR`, box chunking for post-train eval `SAM2_PROMPTED_EVAL_BOX_CHUNK`, base weights `SAM2_CHECKPOINT` / `SAM2_BASE_CHECKPOINT`, YAML `SAM2_MODEL_CFG`, etc.). Mask R-CNN CLI flags mirror `MASK_RCNN_*` env names; see `mask_rcnn_workflow.py` `--help`.
@@ -168,5 +169,5 @@ After training, Mask R-CNN and SAM2 write summaries and artifacts under `output/
 
 - **`check_env.py` reports missing `sam2`:** reinstall from `requirements.txt` inside the same venv you use for `uvicorn`.
 - **CUDA not used:** reinstall `torch`/`torchvision` from the PyTorch CUDA wheel index for your platform (see `requirements.txt`).
-- **Mask R-CNN training MemoryError on Windows:** keep `MASK_RCNN_DATALOADER_WORKERS=0` (default from API).
+- **Mask R-CNN training killed (return code -9) or MemoryError:** the workflow no longer materializes full-resolution masks for all ~45k instances at startup (polygons are rasterized per batch at 512²). On macOS/Windows the API also sets `MASK_RCNN_DATALOADER_WORKERS=0` and `MASK_RCNN_BATCH_SIZE=1`.
 - **SAM2 OOM after epoch / during eval:** lower `SAM2_PROMPTED_EVAL_BOX_CHUNK` (default `1`) or reduce image/prompt size via env vars documented in `sam2_workflow.py`.

@@ -13,11 +13,6 @@ const EVALUATION_TABLE_ROWS = [
 ];
 
 const METHOD_LABELS = Object.fromEntries(EVALUATION_TABLE_ROWS.map(({ key, label }) => [key, label]));
-const SEGMENT_SENSITIVITY_OPTIONS = [
-  { key: "conservative", label: "Conservative" },
-  { key: "balanced", label: "Balanced" },
-  { key: "recall", label: "Recall" }
-];
 
 /** Matches API `class_colors` / mask visualization (background, tree, tree group). */
 const STATIC_CLASS_LEGEND = [
@@ -69,7 +64,6 @@ function App() {
   const [activeView, setActiveView] = useState("evaluation");
   const [file, setFile] = useState(null);
   const [method, setMethod] = useState("sam2");
-  const [segmentSensitivity, setSegmentSensitivity] = useState("balanced");
   const [previewUrl, setPreviewUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -199,7 +193,6 @@ function App() {
       formData.append("file", file);
       formData.append("method", method);
       formData.append("strict_conservation_mode", "false");
-      formData.append("segment_sensitivity", segmentSensitivity);
       const response = await fetch(`${API_BASE}/api/segment`, {
         method: "POST",
         body: formData
@@ -501,20 +494,6 @@ function App() {
                   <option value="sam2">SAM2 (prompted segmentation)</option>
                 </select>
               </label>
-              <label className="seg-field">
-                <span className="seg-field-label">Sensitivity</span>
-                <select
-                  value={segmentSensitivity}
-                  onChange={(event) => setSegmentSensitivity(event.target.value)}
-                  aria-label="Segmentation sensitivity"
-                >
-                  {SEGMENT_SENSITIVITY_OPTIONS.map((opt) => (
-                    <option key={opt.key} value={opt.key}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
               <label className="seg-field seg-field-file">
                 <span className="seg-field-label">Test image</span>
                 <input type="file" accept="image/*,.tif,.tiff" onChange={onFileChange} />
@@ -628,9 +607,9 @@ function App() {
                 <option value="maskrcnn">Mask R-CNN</option>
                 <option value="sam2">SAM2</option>
               </select>
-              <span className="training-tier-label" title="Only the best-quality training preset is available.">
+              {/* <span className="training-tier-label" title="Only the best-quality training preset is available.">
                 Best quality
-              </span>
+              </span> */}
               <button type="button" onClick={startTraining} disabled={trainingBusy || isSelectedTrainingRunning}>
                 {trainingBusy || isSelectedTrainingRunning ? "Start Training (Running...)" : "Start Training"}
               </button>

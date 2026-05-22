@@ -98,6 +98,12 @@ CLASS_COLORS_HEX = {
     for class_id, rgb in CLASS_COLORS_RGB.items()
 }
 
+# Fixed segmentation presets (not exposed in the UI).
+SAM2_SEGMENT_SENSITIVITY_DEFAULT = "balanced"
+MASK_RCNN_INFERENCE_MIN_SCORE = 0.35
+MASK_RCNN_INFERENCE_MIN_PIXELS = 40
+MASK_RCNN_INFERENCE_MAX_OVERLAP_FRAC = 0.2
+
 
 def _land_use_assessment(
     distribution: dict[str, float],
@@ -748,7 +754,9 @@ class SAM2SegmentationService:
                 out[region] = 0
         return out
 
-    def _sam2_segment(self, image_bytes: bytes, segment_sensitivity: str = "balanced") -> tuple[Image.Image, np.ndarray]:
+    def _sam2_segment(
+        self, image_bytes: bytes, segment_sensitivity: str = SAM2_SEGMENT_SENSITIVITY_DEFAULT
+    ) -> tuple[Image.Image, np.ndarray]:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         rgb = np.asarray(image, dtype=np.uint8).copy()
         height, width = rgb.shape[:2]
@@ -872,7 +880,7 @@ class SAM2SegmentationService:
         return image, seg_mask
 
     def _predict_components(
-        self, image_bytes: bytes, filename: str, segment_sensitivity: str = "balanced"
+        self, image_bytes: bytes, filename: str, segment_sensitivity: str = SAM2_SEGMENT_SENSITIVITY_DEFAULT
     ) -> tuple[Image.Image, np.ndarray, int, str, str]:
         self._invalidate_if_checkpoint_changed()
         self._load()
@@ -889,12 +897,11 @@ class SAM2SegmentationService:
         image_bytes: bytes,
         filename: str,
         strict_conservation_mode: bool = False,
-        segment_sensitivity: str = "balanced",
     ) -> dict:
         original_image, seg_mask, scene_class, inference_mode, fallback_reason = self._predict_components(
             image_bytes,
             filename,
-            segment_sensitivity=segment_sensitivity,
+            segment_sensitivity=SAM2_SEGMENT_SENSITIVITY_DEFAULT,
         )
         return build_response(
             original_image=original_image,
@@ -1082,9 +1089,12 @@ class MaskRCNNSegmentationService:
         labels = output.get("labels", torch.empty((0,), device=self._device)).detach().cpu().numpy()
         masks = output.get("masks", torch.empty((0, 1, side, side), device=self._device)).detach().cpu().numpy()
         order = np.argsort(scores)[::-1]
+        min_score = float(os.environ.get("MASK_RCNN_MIN_SCORE", str(MASK_RCNN_INFERENCE_MIN_SCORE)))
+        min_pixels = max(10, int(os.environ.get("MASK_RCNN_MIN_PIXELS", str(MASK_RCNN_INFERENCE_MIN_PIXELS))))
+        max_overlap = float(os.environ.get("MASK_RCNN_MAX_OVERLAP_FRAC", str(MASK_RCNN_INFERENCE_MAX_OVERLAP_FRAC)))
         for idx in order:
             score = float(scores[idx])
-            if score < 0.4:
+            if score < min_score:
                 continue
             label = int(labels[idx])
             if label not in (1, 2):
@@ -1093,13 +1103,13 @@ class MaskRCNNSegmentationService:
             instance_mask = cv2.resize(
                 instance_small.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST,
             ).astype(bool)
-            if instance_mask.sum() < 50:
+            if instance_mask.sum() < min_pixels:
                 continue
             overlap = np.logical_and(instance_mask, occupancy).sum()
-            if overlap > 0 and overlap / float(instance_mask.sum()) > 0.2:
+            if overlap > 0 and overlap / float(instance_mask.sum()) > max_overlap:
                 continue
             instance_mask = np.logical_and(instance_mask, np.logical_not(occupancy))
-            if instance_mask.sum() < 50:
+            if instance_mask.sum() < min_pixels:
                 continue
             class_id = 2 if (label == 2 or int(instance_mask.sum()) >= group_area_threshold) else 1
             seg_mask[instance_mask] = class_id

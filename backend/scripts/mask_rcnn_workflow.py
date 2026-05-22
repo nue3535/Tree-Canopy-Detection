@@ -1,7 +1,7 @@
 """Mask R-CNN: joint **object detection** (boxes + class: individual_tree / group_of_trees) and **instance segmentation**
 (mask head), aligned with tree_canopy_multimodel_training_evaluation_fixed.ipynb:
 maskrcnn_resnet50_fpn(weights=DEFAULT) + replaced ROI heads for 3 classes; 512² inputs; batch 2; AdamW lr=1e-4, wd=1e-4;
-default 500 epochs with optional validation early stopping (patience 50). On Windows, DataLoader workers default to 0 to avoid spawn MemoryErrors.
+default 500 epochs with optional validation early stopping (patience 50). On macOS/Windows, DataLoader workers default to 0 to avoid spawn OOM. Annotations store polygons only (masks rasterized per batch).
 """
 
 from __future__ import annotations
@@ -81,6 +81,77 @@ def _polygon_binary_mask(width: int, height: int, segmentation: list[float]) -> 
     return mask
 
 
+def _polygon_area(segmentation: list[float]) -> float:
+    """Shoelace area for instance sorting without rasterizing full-resolution masks."""
+    if len(segmentation) < 6 or len(segmentation) % 2 != 0:
+        return 0.0
+    pts = np.asarray(segmentation, dtype=np.float32).reshape(-1, 2)
+    if pts.shape[0] < 3:
+        return 0.0
+    x = pts[:, 0]
+    y = pts[:, 1]
+    return float(0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))))
+
+
+def _instance_mask(
+    instance: dict,
+    width: int,
+    height: int,
+    *,
+    out_width: int | None = None,
+    out_height: int | None = None,
+) -> np.ndarray:
+    """Rasterize one instance; supports legacy records that still store ``mask`` arrays."""
+    if "mask" in instance:
+        mask = instance["mask"]
+        if out_width is not None and out_height is not None and (
+            mask.shape[1] != out_width or mask.shape[0] != out_height
+        ):
+            return cv2.resize(
+                mask.astype(np.uint8),
+                (out_width, out_height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        return mask.astype(np.uint8)
+    target_w = out_width if out_width is not None else width
+    target_h = out_height if out_height is not None else height
+    return _polygon_binary_mask(target_w, target_h, instance.get("segmentation", []))
+
+
+def _instances_for_training(
+    instances: list[dict],
+    width: int,
+    height: int,
+    img_size: int,
+    max_instances_per_image: int,
+) -> tuple[list[np.ndarray], list[int]]:
+    """Keep top-N instances by polygon area; rasterize only at training resolution."""
+    ranked = sorted(
+        instances,
+        key=lambda inst: _polygon_area(inst.get("segmentation", [])) if "segmentation" in inst else int(np.sum(inst.get("mask", 0))),
+        reverse=True,
+    )
+    if len(ranked) > max_instances_per_image:
+        ranked = ranked[:max_instances_per_image]
+    masks = [
+        _instance_mask(inst, width, height, out_width=img_size, out_height=img_size)
+        for inst in ranked
+    ]
+    labels = [int(inst["label"]) for inst in ranked]
+    return masks, labels
+
+
+def _gt_mask_from_instances(instances: list[dict], width: int, height: int) -> np.ndarray:
+    """Build a full-resolution GT mask one instance at a time (low peak memory)."""
+    gt_mask = np.zeros((height, width), dtype=np.uint8)
+    for inst in instances:
+        mask = _instance_mask(inst, width, height)
+        if int(mask.sum()) == 0:
+            continue
+        gt_mask[mask > 0] = int(inst["label"])
+    return gt_mask
+
+
 @dataclass
 class TrainConfig:
     project_root: Path
@@ -93,19 +164,28 @@ class TrainConfig:
     epochs: int = 500
     lr: float = 1e-4
     weight_decay: float = 1e-4
-    workers: int = 0 if sys.platform == "win32" else 2
+    workers: int = 0 if sys.platform in {"win32", "darwin"} else 2
     early_stopping_patience: int = 50
     early_stopping_min_delta: float = 1e-4
 
 
 def _build_mask_rcnn(num_classes: int = 3) -> torch.nn.Module:
     """maskrcnn_resnet50_fpn with ImageNet backbone, heads replaced for `num_classes` (incl. background)."""
-    try:
-        from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
+    from backend.app.ssl_downloads import patch_default_https_context
+    from torchvision.models import ResNet50_Weights
+    from torchvision.models.detection import MaskRCNN_ResNet50_FPN_Weights
 
+    patch_default_https_context()
+    print("[Mask R-CNN] loading ResNet50-FPN backbone (COCO pretrained when available)...", flush=True)
+    try:
         model = maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
-    except Exception:
-        model = maskrcnn_resnet50_fpn(weights="DEFAULT")
+    except Exception as exc:
+        print(
+            f"[Mask R-CNN][WARN] Could not load COCO pretrained weights ({exc}). "
+            "Training from random initialization (no backbone download).",
+            flush=True,
+        )
+        model = maskrcnn_resnet50_fpn(weights=None, weights_backbone=None)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
@@ -132,17 +212,15 @@ class DetectionDataset(Dataset):
         image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        instances = record["instances"]
-        if len(instances) > self.max_instances_per_image:
-            instances = sorted(instances, key=lambda inst: int(np.sum(inst["mask"])), reverse=True)[
-                : self.max_instances_per_image
-            ]
-
-        inst_masks_resized = [
-            cv2.resize(inst["mask"].astype(np.uint8), (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
-            for inst in instances
-        ]
-        inst_labels = [int(inst["label"]) for inst in instances]
+        width = int(record.get("width", orig_w))
+        height = int(record.get("height", orig_h))
+        inst_masks_resized, inst_labels = _instances_for_training(
+            record["instances"],
+            width,
+            height,
+            self.img_size,
+            self.max_instances_per_image,
+        )
 
         if self.training:
             image, inst_masks_resized = apply_augmentation(image, inst_masks_resized)
@@ -270,13 +348,18 @@ def _load_records(config: TrainConfig) -> tuple[list[dict], list[dict]]:
             label = 1 if class_name == "individual_tree" else 2 if class_name == "group_of_trees" else None
             if label is None:
                 continue
-            mask = _polygon_binary_mask(width, height, ann.get("segmentation", []))
-            if int(mask.sum()) == 0:
+            segmentation = ann.get("segmentation", [])
+            if len(segmentation) < 6:
                 continue
-            instances.append({"mask": mask, "label": label})
+            instances.append({"segmentation": segmentation, "label": label})
         if not instances:
             continue
-        record = {"image_path": image_path, "instances": instances}
+        record = {
+            "image_path": image_path,
+            "width": width,
+            "height": height,
+            "instances": instances,
+        }
         if stem in val_split:
             val_records.append(record)
         elif stem in train_split:
@@ -346,9 +429,11 @@ def _compute_maskrcnn_accuracy(
         image_bgr = cv2.imread(str(record["image_path"]))
         if image_bgr is None:
             continue
-        gt_mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
-        for inst in record["instances"]:
-            gt_mask[inst["mask"] > 0] = int(inst["label"])
+        gt_mask = _gt_mask_from_instances(
+            record["instances"],
+            int(record.get("width", image_bgr.shape[1])),
+            int(record.get("height", image_bgr.shape[0])),
+        )
         pred_mask = _predict_mask(model, image_bgr, config, device)
         correct += int(np.sum(pred_mask == gt_mask))
         total += int(gt_mask.size)
@@ -386,13 +471,13 @@ def _compute_test_accuracy_maskrcnn(
                 label = 1 if cls_name == "individual_tree" else 2 if cls_name == "group_of_trees" else None
                 if label is None:
                     continue
-                mask = _polygon_binary_mask(w, h, ann.get("segmentation", []))
-                if int(mask.sum()) == 0:
+                segmentation = ann.get("segmentation", [])
+                if len(segmentation) < 6:
                     continue
-                instances.append({"mask": mask, "label": label})
+                instances.append({"segmentation": segmentation, "label": label})
             if not instances:
                 continue
-            records.append({"image_path": img_path, "instances": instances})
+            records.append({"image_path": img_path, "width": w, "height": h, "instances": instances})
         if not records:
             return None
         return _compute_maskrcnn_accuracy(model, records, config, device)
@@ -424,9 +509,11 @@ def _save_evaluation_artifacts(
         if image_bgr is None:
             continue
 
-        gt_mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
-        for instance in record["instances"]:
-            gt_mask[instance["mask"] > 0] = int(instance["label"])
+        gt_mask = _gt_mask_from_instances(
+            record["instances"],
+            int(record.get("width", image_bgr.shape[1])),
+            int(record.get("height", image_bgr.shape[0])),
+        )
 
         pred_mask = _predict_mask(model, image_bgr, config, device)
 
@@ -513,6 +600,7 @@ def _save_evaluation_artifacts(
 def train(config: TrainConfig) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
+    print("[Mask R-CNN] starting training workflow...", flush=True)
     config.save_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_records, val_records = _load_records(config)
@@ -701,7 +789,7 @@ def train(config: TrainConfig) -> None:
         "timestamp": int(time.time()),
         "config_note": (
             "Mask R-CNN ResNet50-FPN, 512², AdamW. Default 500 epochs; early stopping on val_loss when patience>0. "
-            "Windows: num_workers=0 recommended (avoids DataLoader spawn MemoryError)."
+            "macOS/Windows: num_workers=0 recommended (avoids DataLoader spawn MemoryError / OOM)."
         ),
     }
     (eval_root / "training_results.json").write_text(
@@ -717,14 +805,17 @@ def train(config: TrainConfig) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    _win = sys.platform == "win32"
-    _default_workers = 0 if _win else 2
+    _default_workers = 0 if sys.platform in {"win32", "darwin"} else 2
     parser = argparse.ArgumentParser(description="Mask R-CNN training workflow")
     parser.add_argument("action", choices=["train"], default="train")
     parser.add_argument("--epochs", type=int, default=_int_env("MASK_RCNN_EPOCHS", 500))
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=_int_env("MASK_RCNN_BATCH_SIZE", 2))
     parser.add_argument("--img-size", type=int, default=512)
-    parser.add_argument("--max-instances-per-image", type=int, default=80)
+    parser.add_argument(
+        "--max-instances-per-image",
+        type=int,
+        default=_int_env("MASK_RCNN_MAX_INSTANCES_PER_IMAGE", 80),
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(

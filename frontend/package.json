@@ -1,8 +1,9 @@
 {
   "name": "tree-canopy-frontend",
-  "private": true,
   "version": "1.0.0",
+  "private": true,
   "type": "module",
+  "description": "Tree canopy segmentation UI (React + Vite)",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
